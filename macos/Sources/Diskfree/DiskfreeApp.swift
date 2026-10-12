@@ -23,8 +23,7 @@ struct DiskfreeApp: App {
 
     var body: some Scene {
         WindowGroup("diskfree") {
-            ContentView()
-                .environment(model)
+            ContentView(model: model)
                 .frame(minWidth: 760, minHeight: 480)
                 .onAppear {
                     // `Diskfree <path>` scans on launch, like the egui app.
@@ -96,33 +95,33 @@ struct DiskfreeApp: App {
 }
 
 struct ContentView: View {
-    @Environment(Model.self) private var model
+    let model: Model
 
     var body: some View {
         @Bindable var model = model
         ZStack(alignment: .bottom) {
             if model.hasTree {
-                TreeTable()
+                TreeTable(model: model)
             } else {
                 ContentUnavailableView("Pick a volume or a folder", systemImage: "internaldrive",
                                        description: Text("Then press Scan."))
             }
             if model.scanning {
-                ScanProgress()
+                ScanProgress(model: model)
             } else if model.hasTree {
-                InfoBar()
+                InfoBar(model: model)
             }
         }
-        .toolbar { Toolbar() }
+        .toolbar { Toolbar(model: model) }
         .searchable(text: $model.filter, placement: .toolbar, prompt: "Filter names")
         .inspector(isPresented: $model.showInsights) {
-            InsightsView().inspectorColumnWidth(min: 280, ideal: 360, max: 600)
+            InsightsView(model: model).inspectorColumnWidth(min: 280, ideal: 360, max: 600)
         }
     }
 }
 
 struct TreeTable: View {
-    @Environment(Model.self) private var model
+    let model: Model
 
     var body: some View {
         @Bindable var model = model
@@ -131,7 +130,7 @@ struct TreeTable: View {
         ScrollViewReader { proxy in
             Table(model.rows, selection: $model.selection) {
                 TableColumn("Name") { row in
-                    NameCell(row: row, dimmed: row.node.mtime > recent)
+                    NameCell(model: model, row: row, dimmed: row.node.mtime > recent)
                 }
                 .width(min: 260, ideal: 480)
                 TableColumn("Size") { row in
@@ -155,7 +154,7 @@ struct TreeTable: View {
                 .width(min: 40, ideal: 55)
             }
             .contextMenu(forSelectionType: UInt32.self) { ids in
-                if !ids.isEmpty { RowMenu(ids: ids) }
+                if !ids.isEmpty { RowMenu(model: model, ids: ids) }
             } primaryAction: { ids in
                 // Double-click / Return toggles folders.
                 for id in ids { model.toggle(id) }
@@ -206,7 +205,7 @@ struct TreeTable: View {
 }
 
 struct RowMenu: View {
-    @Environment(Model.self) private var model
+    let model: Model
     let ids: Set<UInt32>
 
     var body: some View {
@@ -228,7 +227,7 @@ struct RowMenu: View {
 }
 
 struct NameCell: View {
-    @Environment(Model.self) private var model
+    let model: Model
     let row: Row
     let dimmed: Bool
 
@@ -280,7 +279,7 @@ enum InsightsTab: String, CaseIterable, Identifiable {
 }
 
 struct InsightsView: View {
-    @Environment(Model.self) private var model
+    let model: Model
     @State private var tab = InsightsTab.hints
 
     var body: some View {
@@ -361,7 +360,7 @@ struct InsightsView: View {
 
 /// Floating glass bar: disk usage, selection total and status.
 struct InfoBar: View {
-    @Environment(Model.self) private var model
+    let model: Model
 
     var body: some View {
         let sel = model.selectionSize()
@@ -391,7 +390,7 @@ struct InfoBar: View {
 }
 
 struct ScanProgress: View {
-    @Environment(Model.self) private var model
+    let model: Model
 
     var body: some View {
         HStack(spacing: 10) {
@@ -410,7 +409,7 @@ struct ScanProgress: View {
 }
 
 struct Toolbar: ToolbarContent {
-    @Environment(Model.self) private var model
+    let model: Model
 
     var body: some ToolbarContent {
         @Bindable var model = model
