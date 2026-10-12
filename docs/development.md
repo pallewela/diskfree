@@ -34,6 +34,19 @@ To sanity-check totals against the OS:
 du -sh ~/dev ~/dev/* | sort -rh | head -5
 ```
 
+## Native macOS app (macOS 26+)
+
+The SwiftUI front end lives in `macos/`, a SwiftPM package. Xcode isn't needed; the Command Line Tools with the macOS 26 SDK are enough. It links the Rust core as `target/release/libdiskfree.a` through the `DiskfreeCore` C module (`include/diskfree.h`).
+
+```sh
+cargo build --release --lib                # rebuild the core whenever src/ changes
+cd macos && swift build -c release
+.build/release/Diskfree ~/dev              # GUI, scanning on launch
+.build/release/Diskfree --cli ~/dev        # headless check of the C ABI from Swift
+```
+
+The macOS app shows sizes in decimal units (GB), like Finder. The egui app uses binary units (GiB).
+
 ## Benchmarks
 
 Run each case twice with warm caches and report the second run. On macOS, `-l` also prints peak memory:

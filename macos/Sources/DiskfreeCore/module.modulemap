@@ -1,0 +1,5 @@
+module DiskfreeCore [system] {
+    header "shim.h"
+    link "diskfree"
+    export *
+}
