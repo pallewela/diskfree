@@ -12,6 +12,10 @@ struct DiskfreeApp: App {
             cli(args[2])
             exit(0)
         }
+        if args.count > 1, args[1] == "--selftest" {
+            selftest()
+            exit(0)
+        }
         // Running as a bare SwiftPM executable: become a regular, frontmost app.
         NSApplication.shared.setActivationPolicy(.regular)
         DispatchQueue.main.async { NSApp.activate() }
@@ -50,6 +54,39 @@ struct DiskfreeApp: App {
     }
     model.toggle(0)
     precondition(model.rows.count == 1, "collapsing the root leaves one row")
+}
+
+/// End-to-end check of the actions on a temp folder: trash (real Trash) and rescan.
+@MainActor func selftest() {
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("diskfree-selftest-\(getpid())")
+    try? fm.removeItem(at: dir)
+    try! fm.createDirectory(at: dir.appendingPathComponent("junk"), withIntermediateDirectories: true)
+    try! Data(count: 1_000_000).write(to: dir.appendingPathComponent("junk/big.bin"))
+    try! Data(count: 100_000).write(to: dir.appendingPathComponent("keep.bin"))
+
+    let model = Model()
+    model.load(dir.path)
+    model.toggle(0)
+    let junk = model.rows.first { $0.name == "junk" }!.id
+    let keepSize = model.rows.first { $0.name == "keep.bin" }!.node.size
+    model.selection = [junk, 0]
+    model.askTrash(model.selection)
+    precondition(model.pendingTrash.isEmpty, "root (and anything under a selected root) is never trashed")
+    model.askTrash([junk])
+    model.trashPending()
+    let trashed = model.status
+    precondition(!fm.fileExists(atPath: dir.appendingPathComponent("junk").path), "junk moved to Trash")
+    precondition(model.node(0)!.size == keepSize, "root total drops by the trashed size")
+    precondition(model.rows.count == 2, "root + keep.bin")
+
+    try! Data(count: 300_000).write(to: dir.appendingPathComponent("new.bin"))
+    model.rescan([0])
+    while model.scanning { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    precondition(model.rows.contains { $0.name == "new.bin" }, "rescan picks up new files")
+    precondition(model.node(0)!.files == 2)
+    try? fm.removeItem(at: dir)
+    print("selftest ok — \(trashed)")
 }
 
 struct ContentView: View {
@@ -107,13 +144,40 @@ struct TreeTable: View {
             }
             .width(min: 40, ideal: 55)
         }
-        .contextMenu(forSelectionType: UInt32.self) { _ in
+        .contextMenu(forSelectionType: UInt32.self) { ids in
+            if !ids.isEmpty { RowMenu(ids: ids) }
         } primaryAction: { ids in
             // Double-click / Return toggles folders.
             for id in ids { model.toggle(id) }
         }
         .onKeyPress(.rightArrow) { model.setExpanded(model.selection, true); return .handled }
         .onKeyPress(.leftArrow) { model.setExpanded(model.selection, false); return .handled }
+        .onDeleteCommand { model.askTrash(model.selection) }
+        .confirmationDialog(
+            trashTitle,
+            isPresented: Binding(get: { !model.pendingTrash.isEmpty }, set: { if !$0 { model.pendingTrash = [] } }),
+            titleVisibility: .visible
+        ) {
+            Button("Move to Trash", role: .destructive) { model.trashPending() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(trashMessage)
+        }
+    }
+
+    private var trashTitle: String {
+        let n = model.pendingTrash.count
+        return n == 1 ? "Move “\(model.node(model.pendingTrash[0])?.nameString ?? "")” to Trash?" : "Move \(n) items to Trash?"
+    }
+
+    private var trashMessage: String {
+        let ids = model.pendingTrash
+        let nodes = ids.compactMap(model.node)
+        let size = nodes.reduce(0) { $0 + $1.size }, files = nodes.reduce(0) { $0 + $1.files }
+        var lines = ids.prefix(10).map(model.path)
+        if ids.count > 10 { lines.append("…and \(ids.count - 10) more") }
+        lines.append("\(formatBytes(size)) in \(files) files")
+        return lines.joined(separator: "\n")
     }
 
     private func age(_ secs: UInt64) -> String {
@@ -123,6 +187,28 @@ struct TreeTable: View {
         case let d where d < 730: "\(d / 30)mo"
         case let d: "\(d / 365)y"
         }
+    }
+}
+
+struct RowMenu: View {
+    @Environment(Model.self) private var model
+    let ids: Set<UInt32>
+
+    var body: some View {
+        let top = model.topLevel(ids)
+        let many = top.count > 1 ? " (\(top.count) items)" : ""
+        let dirs = top.filter { model.node($0)?.isDir == true }
+        Button("Reveal in Finder\(many)", systemImage: "folder") { model.reveal(ids) }
+        Button("Copy Path\(top.count > 1 ? "s" : "")", systemImage: "doc.on.doc") { model.copyPaths(ids) }
+        Button(dirs.count > 1 ? "Rescan \(dirs.count) Folders" : "Rescan", systemImage: "arrow.clockwise") {
+            model.rescan(ids)
+        }
+        .disabled(dirs.isEmpty || model.scanning)
+        Divider()
+        Button(top.count > 1 ? "Move \(top.count) Items to Trash…" : "Move to Trash…", systemImage: "trash", role: .destructive) {
+            model.askTrash(ids)
+        }
+        .disabled(top.allSatisfy { $0 == 0 })
     }
 }
 

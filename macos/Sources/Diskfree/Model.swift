@@ -1,3 +1,4 @@
+import AppKit
 import DiskfreeCore
 import Foundation
 import Observation
@@ -49,6 +50,8 @@ final class Model {
     /// Visible rows, rebuilt after every explorer change.
     private(set) var rows: [Row] = []
     var selection = Set<UInt32>()
+    /// Top-level ids awaiting the Move to Trash confirmation.
+    var pendingTrash: [UInt32] = []
     /// Bumped after every explorer change so views re-read nodes.
     private(set) var revision = 0
 
@@ -60,6 +63,8 @@ final class Model {
     }
 
     @ObservationIgnored private var job: OpaquePointer?
+    @ObservationIgnored private var target: UInt32? // job is a rescan of this node
+    @ObservationIgnored private var rescanQueue: [UInt32] = []
     @ObservationIgnored private(set) var ex: OpaquePointer?
 
     var hasTree: Bool { _ = revision; return ex != nil }
@@ -96,6 +101,19 @@ final class Model {
     /// Take the finished (or cancelled) job's tree as the new explorer.
     private func adopt() {
         guard let job else { return }
+        if let id = target, let ex {
+            // A cancelled rescan is discarded by the core; stop the queue too.
+            let cancelled = df_scan_cancelled(job)
+            df_scan_finish_graft(job, ex, id)
+            (self.job, target) = (nil, nil)
+            if cancelled {
+                rescanQueue = []
+                status = "Rescan cancelled."
+            }
+            if !startNextRescan() { scanning = false }
+            changed()
+            return
+        }
         let cancelled = df_scan_cancelled(job)
         let fresh = df_scan_finish(job, sort.rawValue)
         self.job = nil
@@ -123,6 +141,58 @@ final class Model {
             selection = []
         }
         revision += 1
+    }
+
+    // MARK: - Actions
+
+    func rescan(_ ids: Set<UInt32>) {
+        guard job == nil else { return }
+        rescanQueue = topLevel(ids).filter { node($0)?.isDir == true }
+        status = ""
+        _ = startNextRescan()
+    }
+
+    private func startNextRescan() -> Bool {
+        guard let ex, !rescanQueue.isEmpty else { return false }
+        let id = rescanQueue.removeFirst()
+        target = id
+        job = df_rescan_start(ex, id)
+        scanning = true
+        Task { await poll() }
+        return true
+    }
+
+    func askTrash(_ ids: Set<UInt32>) {
+        pendingTrash = topLevel(ids).filter { $0 != 0 }
+    }
+
+    func trashPending() {
+        guard let ex else { return }
+        var gone: [UInt32] = [], bytes: UInt64 = 0, errors: [String] = []
+        for id in pendingTrash {
+            let url = URL(fileURLWithPath: path(id))
+            do {
+                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+                gone.append(id)
+                bytes += node(id)?.size ?? 0
+            } catch {
+                errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        pendingTrash = []
+        if !gone.isEmpty { df_remove(ex, gone, gone.count) }
+        status = "Moved \(gone.count) item(s), \(formatBytes(bytes)), to Trash."
+        if let first = errors.first { status += " \(errors.count) failed — \(first)" }
+        changed()
+    }
+
+    func reveal(_ ids: Set<UInt32>) {
+        NSWorkspace.shared.activateFileViewerSelecting(topLevel(ids).map { URL(fileURLWithPath: path($0)) })
+    }
+
+    func copyPaths(_ ids: Set<UInt32>) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(topLevel(ids).map(path).joined(separator: "\n"), forType: .string)
     }
 
     func toggle(_ id: UInt32) {
