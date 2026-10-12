@@ -1,3 +1,4 @@
+mod insights;
 mod scan;
 
 use eframe::egui;
@@ -47,6 +48,13 @@ struct Job {
     targets: Vec<u32>, // empty = full scan, else rescan these subtrees
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    Largest,
+    Types,
+    Candidates,
+}
+
 struct App {
     root_input: String,
     disks: sysinfo::Disks,
@@ -65,6 +73,10 @@ struct App {
     hit: Vec<bool>, // name matches filter
     anc: Vec<bool>, // has a matching descendant
     confirm_trash: Option<Vec<u32>>,
+    stats: insights::Stats,
+    show_side: bool,
+    side: Side,
+    age_days: u64, // dim rows changed within this many days; 0 = off
 }
 
 impl Default for App {
@@ -87,6 +99,10 @@ impl Default for App {
             hit: Vec::new(),
             anc: Vec::new(),
             confirm_trash: None,
+            stats: Default::default(),
+            show_side: true,
+            side: Side::Candidates,
+            age_days: 0,
         }
     }
 }
@@ -142,6 +158,27 @@ impl App {
         }
         self.disks.refresh(true);
         self.apply_filter();
+        if let Some(t) = &self.tree {
+            self.stats = insights::compute(t);
+        }
+    }
+
+    /// Expand down to `id`, select it and scroll it into view.
+    fn jump(&mut self, id: u32) {
+        let Some(t) = &self.tree else { return };
+        let mut p = t.nodes[id as usize].parent;
+        while p != u32::MAX {
+            self.expanded[p as usize] = true;
+            p = t.nodes[p as usize].parent;
+        }
+        self.filter.clear();
+        self.apply_filter();
+        if let Some(i) = self.rows.iter().position(|r| r.0 == id) {
+            self.selected = i;
+            self.anchor = i;
+            self.sel = HashSet::from([id]);
+            self.scroll_to = Some(i as f32);
+        }
     }
 
     fn apply_filter(&mut self) {
@@ -289,7 +326,7 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let busy = self.job.is_some();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("vol").selected_text("Volume").show_ui(ui, |ui| {
                 for d in self.disks.list() {
                     let mp = d.mount_point().to_string_lossy();
@@ -327,6 +364,13 @@ impl App {
             if f.changed() {
                 self.apply_filter();
             }
+            let age = |d: u64| if d == 0 { "Dim recent: off".to_string() } else { format!("Dim changed < {d}d") };
+            egui::ComboBox::from_id_salt("age").selected_text(age(self.age_days)).show_ui(ui, |ui| {
+                for d in [0, 7, 30, 90, 365] {
+                    ui.selectable_value(&mut self.age_days, d, age(d));
+                }
+            });
+            ui.toggle_value(&mut self.show_side, "Insights");
         });
         ui.horizontal(|ui| {
             if let Some(j) = &self.job {
@@ -369,6 +413,8 @@ impl App {
             return;
         };
         let busy = self.job.is_some();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let recent = now.saturating_sub(self.age_days * 86_400);
         let row_h = ui.text_style_height(&egui::TextStyle::Body);
         let mut area = egui::ScrollArea::vertical().auto_shrink(false);
         if let Some(i) = self.scroll_to.take() {
@@ -387,6 +433,8 @@ impl App {
                     ui.add_sized([80.0, row_h], egui::Label::new(egui::RichText::new(fmt_size(n.size)).monospace()));
                     ui.add(egui::ProgressBar::new(frac).desired_width(80.0).desired_height(row_h * 0.7));
                     ui.add_sized([70.0, row_h], egui::Label::new(egui::RichText::new(n.files.to_string()).weak()));
+                    let age = if n.mtime == 0 { String::new() } else { insights::fmt_age(now.saturating_sub(n.mtime)) };
+                    ui.add_sized([45.0, row_h], egui::Label::new(egui::RichText::new(age).weak()));
                     ui.add_space(depth as f32 * 14.0);
                     let open = self.expanded[id as usize];
                     let arrow = match (n.kind, n.children.is_empty(), open) {
@@ -403,6 +451,8 @@ impl App {
                     let mut text = egui::RichText::new(label);
                     if self.hit.get(id as usize) == Some(&true) {
                         text = text.strong().color(ui.visuals().warn_fg_color);
+                    } else if self.age_days > 0 && n.mtime > recent {
+                        text = text.color(ui.visuals().weak_text_color());
                     }
                     let is_sel = self.sel.contains(&id);
                     let r = ui.selectable_label(is_sel, text);
@@ -457,6 +507,14 @@ impl App {
                         }
                     });
                     r.on_hover_text(t.path(id).to_string_lossy());
+                    if let Some(h) = insights::hint(t, id) {
+                        ui.label(
+                            egui::RichText::new(format!(" {h} "))
+                                .small()
+                                .color(egui::Color32::WHITE)
+                                .background_color(egui::Color32::from_rgb(60, 110, 190)),
+                        );
+                    }
                 });
             }
             range
@@ -467,6 +525,63 @@ impl App {
         }
         if !rescan.is_empty() {
             self.start_scan(rescan);
+        }
+    }
+
+    fn side_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(t) = &self.tree else {
+            ui.label("Scan first.");
+            return;
+        };
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.side, Side::Candidates, "Cleanup hints");
+            ui.selectable_value(&mut self.side, Side::Largest, "Largest files");
+            ui.selectable_value(&mut self.side, Side::Types, "File types");
+        });
+        ui.separator();
+        let rel = |id: u32| t.path(id).strip_prefix(&t.root).map_or(String::new(), |p| p.display().to_string());
+        let row = |size: u64, rest: String| egui::RichText::new(format!("{:>10}  {rest}", fmt_size(size))).monospace();
+        let (mut jump, mut filter) = (None, None);
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.side {
+            Side::Candidates => {
+                let total: u64 = self.stats.candidates.iter().map(|c| t.nodes[c.0 as usize].size).sum();
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} found, {}", self.stats.candidates.len(), fmt_size(total)));
+                    if ui.button("Select all").on_hover_text("Then press Delete to trash them").clicked() {
+                        self.sel = self.stats.candidates.iter().map(|c| c.0).collect();
+                    }
+                });
+                for &(id, h) in &self.stats.candidates {
+                    let r = ui.selectable_label(self.sel.contains(&id), row(t.nodes[id as usize].size, format!("{}  [{h}]", rel(id))));
+                    if r.clicked() {
+                        jump = Some(id);
+                    }
+                }
+            }
+            Side::Largest => {
+                ui.label(format!("Top {} files", insights::TOP_FILES));
+                for &id in &self.stats.largest {
+                    if ui.selectable_label(self.sel.contains(&id), row(t.nodes[id as usize].size, rel(id))).clicked() {
+                        jump = Some(id);
+                    }
+                }
+            }
+            Side::Types => {
+                for (ext, bytes, files) in &self.stats.types {
+                    let r = ui.selectable_label(false, row(*bytes, format!(".{ext}  ({files} files)")));
+                    if r.on_hover_text("Filter the tree by this extension").clicked() && ext != "(none)" {
+                        filter = Some(format!(".{ext}"));
+                    }
+                }
+            }
+        });
+        if let Some(id) = jump {
+            self.jump(id);
+        }
+        if let Some(f) = filter {
+            self.filter = f;
+            self.apply_filter();
         }
     }
 
@@ -531,6 +646,9 @@ impl eframe::App for App {
         }
         self.keys(ctx);
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
+        if self.show_side {
+            egui::Panel::right("side").resizable(true).default_size(380.0).show(ui, |ui| self.side_panel(ui));
+        }
         egui::CentralPanel::default().show(ui, |ui| self.tree_view(ui));
         self.trash_dialog(ctx);
     }
@@ -543,7 +661,7 @@ mod tests {
     #[test]
     fn top_level_drops_nested() {
         // 0 -> 1 -> 2, 0 -> 3
-        let node = |parent, children| scan::Node { name: "x".into(), size: 1, files: 1, parent, children, kind: Kind::Dir };
+        let node = |parent, children| scan::Node { name: "x".into(), size: 1, files: 1, parent, children, kind: Kind::Dir, mtime: 0 };
         let t = Tree {
             nodes: vec![node(u32::MAX, vec![1, 3]), node(0, vec![2]), node(1, vec![]), node(0, vec![])],
             root: PathBuf::from("/"),

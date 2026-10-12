@@ -3,6 +3,7 @@ use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
@@ -26,6 +27,7 @@ pub struct Node {
     pub parent: u32,
     pub children: Vec<u32>,
     pub kind: Kind,
+    pub mtime: u64, // secs since epoch; for dirs, the newest change anywhere inside
 }
 
 // ponytail: ~80 B/node + name; ~400 MB for 5M entries. Intern names / pack if that hurts.
@@ -52,6 +54,10 @@ const SKIP: &[&str] = if cfg!(target_os = "macos") {
 } else {
     &[]
 };
+
+fn mtime(md: &Metadata) -> u64 {
+    md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())
+}
 
 #[cfg(unix)]
 fn alloc_size(md: &Metadata) -> u64 {
@@ -85,6 +91,7 @@ impl Tree {
                 parent: u32::MAX,
                 children: Vec::new(),
                 kind: Kind::Dir,
+                mtime: 0,
             }],
             root: root.to_path_buf(),
         };
@@ -93,10 +100,10 @@ impl Tree {
         t
     }
 
-    fn push(&mut self, name: Box<str>, parent: u32, kind: Kind, size: u64) -> u32 {
+    fn push(&mut self, name: Box<str>, parent: u32, kind: Kind, size: u64, mtime: u64) -> u32 {
         let id = self.nodes.len() as u32;
         let files = (kind != Kind::Dir && kind != Kind::Denied) as u64;
-        self.nodes.push(Node { name, size, files, parent, children: Vec::new(), kind });
+        self.nodes.push(Node { name, size, files, parent, children: Vec::new(), kind, mtime });
         self.nodes[parent as usize].children.push(id);
         id
     }
@@ -120,12 +127,12 @@ impl Tree {
                 if SKIP.iter().any(|s| path == Path::new(s)) {
                     continue;
                 }
-                let child = self.push(name, id, Kind::Dir, 0);
+                let child = self.push(name, id, Kind::Dir, 0, mtime(&md));
                 self.walk(&path, child, p, seen);
             } else {
                 let kind = if ft.is_symlink() { Kind::Symlink } else { Kind::File };
                 let size = if seen_before(&md, seen) { 0 } else { alloc_size(&md) };
-                self.push(name, id, kind, size);
+                self.push(name, id, kind, size, mtime(&md));
                 p.files.fetch_add(1, Relaxed);
                 p.bytes.fetch_add(size, Relaxed);
             }
@@ -133,14 +140,15 @@ impl Tree {
         // Roll up and sort largest first.
         let mut kids = std::mem::take(&mut self.nodes[id as usize].children);
         kids.sort_unstable_by_key(|&c| std::cmp::Reverse(self.nodes[c as usize].size));
-        let (size, files) = kids.iter().fold((0, 0), |(s, f), &c| {
-            let n = &self.nodes[c as usize];
-            (s + n.size, f + n.files)
-        });
+        let n = &self.nodes;
+        let size = kids.iter().map(|&c| n[c as usize].size).sum();
+        let files = kids.iter().map(|&c| n[c as usize].files).sum();
+        let newest = kids.iter().map(|&c| n[c as usize].mtime).max().unwrap_or(0);
         let n = &mut self.nodes[id as usize];
         n.children = kids;
         n.size = size;
         n.files = files;
+        n.mtime = n.mtime.max(newest);
     }
 
     pub fn sort_children(&mut self, id: u32, by: Sort) {
@@ -206,6 +214,7 @@ impl Tree {
         old.kind = top.kind;
         old.size = top.size;
         old.files = top.files;
+        old.mtime = top.mtime;
         let parent = old.parent;
         self.sort_children(id, by);
         self.adjust_up(parent, dsize, dfiles, by);
