@@ -2,6 +2,7 @@ mod scan;
 
 use eframe::egui;
 use scan::{fmt_size, Kind, Progress, Sort, Tree};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ fn main() -> eframe::Result {
             let mut app = App::default();
             if let Some(root) = args.get(1) {
                 app.root_input = root.clone();
-                app.start_scan(None);
+                app.start_scan(vec![]);
             }
             Ok(Box::new(app))
         }),
@@ -42,8 +43,8 @@ fn cli(root: &str) {
 
 struct Job {
     progress: Arc<Progress>,
-    handle: JoinHandle<Tree>,
-    target: Option<u32>, // None = full scan, Some(id) = rescan that subtree
+    handle: JoinHandle<Vec<Tree>>,
+    targets: Vec<u32>, // empty = full scan, else rescan these subtrees
 }
 
 struct App {
@@ -53,7 +54,9 @@ struct App {
     sort: Sort,
     expanded: Vec<bool>,
     rows: Vec<(u32, u16)>, // (node id, depth) of currently visible rows
-    selected: usize,
+    selected: usize,    // cursor row
+    sel: HashSet<u32>,  // selected node ids
+    anchor: usize,      // row where shift-click ranges start
     job: Option<Job>,
     status: String,
     visible: std::ops::Range<usize>,
@@ -61,7 +64,7 @@ struct App {
     filter: String,
     hit: Vec<bool>, // name matches filter
     anc: Vec<bool>, // has a matching descendant
-    confirm_trash: Option<u32>,
+    confirm_trash: Option<Vec<u32>>,
 }
 
 impl Default for App {
@@ -74,6 +77,8 @@ impl Default for App {
             expanded: Vec::new(),
             rows: Vec::new(),
             selected: 0,
+            sel: HashSet::new(),
+            anchor: 0,
             job: None,
             status: String::new(),
             visible: 0..0,
@@ -87,34 +92,42 @@ impl Default for App {
 }
 
 impl App {
-    fn start_scan(&mut self, target: Option<u32>) {
-        let root = match (target, &self.tree) {
-            (Some(id), Some(t)) => t.path(id),
-            _ => PathBuf::from(self.root_input.trim()),
+    fn start_scan(&mut self, targets: Vec<u32>) {
+        let roots: Vec<PathBuf> = match &self.tree {
+            Some(t) if !targets.is_empty() => targets.iter().map(|&id| t.path(id)).collect(),
+            _ => vec![PathBuf::from(self.root_input.trim())],
         };
         let progress = Arc::new(Progress::default());
         let p = progress.clone();
-        let handle = std::thread::spawn(move || Tree::scan(&root, &p));
-        self.job = Some(Job { progress, handle, target });
+        let handle = std::thread::spawn(move || roots.iter().map(|r| Tree::scan(r, &p)).collect());
+        self.job = Some(Job { progress, handle, targets });
         self.status.clear();
     }
 
     fn finish_scan(&mut self) {
         let job = self.job.take().unwrap();
-        let sub = job.handle.join().expect("scan thread panicked");
-        if job.progress.cancel.load(Relaxed) {
-            self.status = "Scan cancelled — showing partial results.".into();
-        }
-        match (job.target, &mut self.tree) {
-            (Some(id), Some(t)) => t.graft(id, sub, self.sort),
+        let subs = job.handle.join().expect("scan thread panicked");
+        let cancelled = job.progress.cancel.load(Relaxed);
+        match &mut self.tree {
+            // A cancelled rescan would graft partial sizes; keep the old data instead.
+            Some(_) if cancelled && !job.targets.is_empty() => self.status = "Rescan cancelled.".into(),
+            Some(t) if !job.targets.is_empty() => {
+                for (id, sub) in job.targets.into_iter().zip(subs) {
+                    t.graft(id, sub, self.sort);
+                }
+            }
             _ => {
-                let mut t = sub;
+                if cancelled {
+                    self.status = "Scan cancelled — showing partial results.".into();
+                }
+                let mut t = subs.into_iter().next().unwrap();
                 if self.sort != Sort::Size {
                     t.sort_all(self.sort);
                 }
                 self.tree = Some(t);
                 self.expanded.clear();
                 self.selected = 0;
+                self.sel.clear();
             }
         }
         self.after_tree_change();
@@ -124,6 +137,9 @@ impl App {
     fn after_tree_change(&mut self) {
         let len = self.tree.as_ref().map_or(0, |t| t.nodes.len());
         self.expanded.resize(len, false);
+        if let Some(t) = &self.tree {
+            self.sel.retain(|&id| t.is_live(id));
+        }
         self.disks.refresh(true);
         self.apply_filter();
     }
@@ -180,17 +196,32 @@ impl App {
         self.rebuild_rows();
     }
 
-    fn trash(&mut self, id: u32) {
+    fn trash_all(&mut self, ids: Vec<u32>) {
         let Some(t) = &mut self.tree else { return };
-        let path = t.path(id);
-        match trash::delete(&path) {
-            Ok(()) => {
-                self.status = format!("Moved to Trash: {} ({})", path.display(), fmt_size(t.nodes[id as usize].size));
-                t.remove(id, self.sort);
-                self.after_tree_change();
+        let (mut n, mut bytes, mut errs) = (0, 0, Vec::new());
+        for id in ids {
+            let path = t.path(id);
+            match trash::delete(&path) {
+                Ok(()) => {
+                    n += 1;
+                    bytes += t.nodes[id as usize].size;
+                    t.remove(id, self.sort);
+                }
+                Err(e) => errs.push(format!("{}: {e}", path.display())),
             }
-            Err(e) => self.status = format!("Trash failed for {}: {e}", path.display()),
         }
+        self.status = format!("Moved {n} item(s), {}, to Trash.", fmt_size(bytes));
+        if let Some(e) = errs.first() {
+            self.status += &format!(" {} failed — {e}", errs.len());
+        }
+        self.after_tree_change();
+    }
+
+    /// Selected ids for actions: top-level selection, or the cursor row if nothing is selected.
+    fn action_ids(&self) -> Vec<u32> {
+        let Some(t) = &self.tree else { return vec![] };
+        let ids = top_level(t, &self.sel);
+        if ids.is_empty() { self.rows.get(self.selected).map(|r| r.0).into_iter().collect() } else { ids }
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
@@ -204,6 +235,7 @@ impl App {
         let open = self.expanded[id as usize];
         let parent = n.parent;
         let key = |k| ctx.input(|i| i.key_pressed(k));
+        let shift = ctx.input(|i| i.modifiers.shift);
         let before = self.selected;
         if key(egui::Key::ArrowUp) {
             self.selected = self.selected.saturating_sub(1);
@@ -221,8 +253,26 @@ impl App {
                 self.selected = i;
             }
         }
-        if (key(egui::Key::Delete) || key(egui::Key::Backspace)) && id != 0 {
-            self.confirm_trash = Some(id);
+        if self.selected != before {
+            let nid = self.rows[self.selected].0;
+            if shift {
+                self.sel.insert(nid);
+            } else {
+                self.sel = HashSet::from([nid]);
+                self.anchor = self.selected;
+            }
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
+            self.sel = self.rows.iter().map(|r| r.0).collect();
+        }
+        if key(egui::Key::Escape) {
+            self.sel.clear();
+        }
+        if key(egui::Key::Delete) || key(egui::Key::Backspace) {
+            let ids: Vec<u32> = self.action_ids().into_iter().filter(|&id| id != 0).collect();
+            if !ids.is_empty() {
+                self.confirm_trash = Some(ids);
+            }
         }
         if self.selected != before && !self.visible.contains(&self.selected) {
             self.scroll_to = Some(self.selected as f32);
@@ -256,7 +306,7 @@ impl App {
                     j.progress.cancel.store(true, Relaxed);
                 }
             } else if ui.button("Scan").clicked() || enter {
-                self.start_scan(None);
+                self.start_scan(vec![]);
             }
             ui.separator();
             ui.label("Sort:");
@@ -301,6 +351,14 @@ impl App {
                 ));
                 ui.add(egui::ProgressBar::new(1.0 - free as f32 / total.max(1) as f32).desired_width(120.0));
             }
+            if let Some(t) = &self.tree {
+                let ids = top_level(t, &self.sel);
+                if !ids.is_empty() {
+                    let size: u64 = ids.iter().map(|&id| t.nodes[id as usize].size).sum();
+                    ui.separator();
+                    ui.label(egui::RichText::new(format!("{} selected, {}", ids.len(), fmt_size(size))).strong());
+                }
+            }
             ui.label(egui::RichText::new(&self.status).weak());
         });
     }
@@ -318,7 +376,7 @@ impl App {
             area = area.vertical_scroll_offset((i * step - ui.available_height() / 2.0).max(0.0));
         }
         let mut toggle = None;
-        let mut rescan = None;
+        let mut rescan = Vec::new();
         let out = area.show_rows(ui, row_h, self.rows.len(), |ui, range| {
             for i in range.clone() {
                 let (id, depth) = self.rows[i];
@@ -346,29 +404,56 @@ impl App {
                     if self.hit.get(id as usize) == Some(&true) {
                         text = text.strong().color(ui.visuals().warn_fg_color);
                     }
-                    let r = ui.selectable_label(i == self.selected, text);
-                    if r.clicked() || r.secondary_clicked() {
-                        self.selected = i;
-                    }
-                    if r.clicked() && !n.children.is_empty() {
-                        toggle = Some((id, !open));
-                    }
-                    r.context_menu(|ui| {
-                        let path = t.path(id);
-                        if ui.button("Reveal in file manager").clicked() {
-                            if let Err(e) = opener::reveal(&path) {
-                                self.status = format!("Reveal failed: {e}");
+                    let is_sel = self.sel.contains(&id);
+                    let r = ui.selectable_label(is_sel, text);
+                    if r.clicked() {
+                        let m = ui.input(|i| i.modifiers);
+                        if m.shift {
+                            let a = self.anchor.min(self.rows.len() - 1);
+                            self.sel = self.rows[a.min(i)..=a.max(i)].iter().map(|r| r.0).collect();
+                        } else if m.command {
+                            if !self.sel.remove(&id) {
+                                self.sel.insert(id);
+                            }
+                            self.anchor = i;
+                        } else {
+                            self.sel = HashSet::from([id]);
+                            self.anchor = i;
+                            if !n.children.is_empty() {
+                                toggle = Some((id, !open));
                             }
                         }
-                        if ui.button("Copy path").clicked() {
-                            ui.ctx().copy_text(path.to_string_lossy().into_owned());
+                        self.selected = i;
+                    }
+                    if r.secondary_clicked() && !is_sel {
+                        self.sel = HashSet::from([id]);
+                        self.anchor = i;
+                        self.selected = i;
+                    }
+                    r.context_menu(|ui| {
+                        let ids = top_level(t, &self.sel);
+                        let many = if ids.len() > 1 { format!(" ({} items)", ids.len()) } else { String::new() };
+                        if ui.button(format!("Reveal in file manager{many}")).clicked() {
+                            for &id in &ids {
+                                if let Err(e) = opener::reveal(t.path(id)) {
+                                    self.status = format!("Reveal failed: {e}");
+                                }
+                            }
                         }
-                        let is_dir = matches!(n.kind, Kind::Dir | Kind::Denied);
-                        if ui.add_enabled(is_dir && !busy, egui::Button::new("Rescan")).clicked() {
-                            rescan = Some(id);
+                        if ui.button(format!("Copy path{many}")).clicked() {
+                            let paths: Vec<String> = ids.iter().map(|&id| t.path(id).to_string_lossy().into_owned()).collect();
+                            ui.ctx().copy_text(paths.join("\n"));
                         }
-                        if ui.add_enabled(id != 0, egui::Button::new("Move to Trash…")).clicked() {
-                            self.confirm_trash = Some(id);
+                        let dirs: Vec<u32> =
+                            ids.iter().copied().filter(|&id| matches!(t.nodes[id as usize].kind, Kind::Dir | Kind::Denied)).collect();
+                        let label = if dirs.len() > 1 { format!("Rescan ({} folders)", dirs.len()) } else { "Rescan".into() };
+                        if ui.add_enabled(!dirs.is_empty() && !busy, egui::Button::new(label)).clicked() {
+                            rescan = dirs;
+                        }
+                        let doomed: Vec<u32> = ids.into_iter().filter(|&id| id != 0).collect();
+                        let label = if doomed.len() > 1 { format!("Move {} items to Trash…", doomed.len()) } else { "Move to Trash…".into() };
+                        if ui.add_enabled(!doomed.is_empty(), egui::Button::new(label)).clicked() {
+                            self.confirm_trash = Some(doomed);
                         }
                     });
                     r.on_hover_text(t.path(id).to_string_lossy());
@@ -380,19 +465,25 @@ impl App {
         if let Some((id, open)) = toggle {
             self.toggle(id, open);
         }
-        if let Some(id) = rescan {
-            self.start_scan(Some(id));
+        if !rescan.is_empty() {
+            self.start_scan(rescan);
         }
     }
 
     fn trash_dialog(&mut self, ctx: &egui::Context) {
-        let (Some(id), Some(t)) = (self.confirm_trash, &self.tree) else { return };
-        let n = &t.nodes[id as usize];
-        let (path, size, files) = (t.path(id), n.size, n.files);
+        let (Some(ids), Some(t)) = (&self.confirm_trash, &self.tree) else { return };
+        let size: u64 = ids.iter().map(|&id| t.nodes[id as usize].size).sum();
+        let files: u64 = ids.iter().map(|&id| t.nodes[id as usize].files).sum();
         let mut answer = None;
         egui::Modal::new("trash".into()).show(ctx, |ui| {
-            ui.heading("Move to Trash?");
-            ui.label(path.to_string_lossy());
+            ui.heading(format!("Move {} item(s) to Trash?", ids.len()));
+            const SHOW: usize = 10;
+            for &id in ids.iter().take(SHOW) {
+                ui.label(t.path(id).to_string_lossy());
+            }
+            if ids.len() > SHOW {
+                ui.label(format!("…and {} more", ids.len() - SHOW));
+            }
             ui.label(format!("{} in {files} files", fmt_size(size)));
             ui.horizontal(|ui| {
                 if ui.button("Move to Trash").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -404,12 +495,32 @@ impl App {
             });
         });
         if let Some(yes) = answer {
-            self.confirm_trash = None;
+            let ids = self.confirm_trash.take().unwrap();
             if yes {
-                self.trash(id);
+                self.trash_all(ids);
             }
         }
     }
+}
+
+/// Selected ids whose ancestors are not also selected (so nothing is counted or trashed twice).
+fn top_level(t: &Tree, sel: &HashSet<u32>) -> Vec<u32> {
+    let mut v: Vec<u32> = sel
+        .iter()
+        .copied()
+        .filter(|&id| {
+            let mut p = t.nodes[id as usize].parent;
+            while p != u32::MAX {
+                if sel.contains(&p) {
+                    return false;
+                }
+                p = t.nodes[p as usize].parent;
+            }
+            true
+        })
+        .collect();
+    v.sort_unstable();
+    v
 }
 
 impl eframe::App for App {
@@ -422,5 +533,22 @@ impl eframe::App for App {
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::CentralPanel::default().show(ui, |ui| self.tree_view(ui));
         self.trash_dialog(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_level_drops_nested() {
+        // 0 -> 1 -> 2, 0 -> 3
+        let node = |parent, children| scan::Node { name: "x".into(), size: 1, files: 1, parent, children, kind: Kind::Dir };
+        let t = Tree {
+            nodes: vec![node(u32::MAX, vec![1, 3]), node(0, vec![2]), node(1, vec![]), node(0, vec![])],
+            root: PathBuf::from("/"),
+        };
+        assert_eq!(top_level(&t, &HashSet::from([1, 2, 3])), vec![1, 3]);
+        assert_eq!(top_level(&t, &HashSet::from([0, 2])), vec![0]);
     }
 }

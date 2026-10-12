@@ -211,6 +211,17 @@ impl Tree {
         self.adjust_up(parent, dsize, dfiles, by);
     }
 
+    /// Still attached to the tree (not trashed or replaced by a rescan).
+    pub fn is_live(&self, mut id: u32) -> bool {
+        while id != 0 {
+            id = self.nodes[id as usize].parent;
+            if id == u32::MAX {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn path(&self, mut id: u32) -> PathBuf {
         let mut parts = Vec::new();
         while id != 0 {
@@ -276,6 +287,7 @@ mod tests {
         let small = t.nodes[0].children[1];
         t.remove(small, Sort::Size);
         assert_eq!(t.nodes[0].size, a + link);
+        assert!(!t.is_live(small));
         fs::remove_file(scan_root.join("big/inner/a.bin")).unwrap();
         let big = t.nodes[0].children[0];
         let sub = Tree::scan(&t.path(big), &Progress::default());
