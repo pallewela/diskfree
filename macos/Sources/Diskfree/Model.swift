@@ -24,6 +24,15 @@ struct Volume: Identifiable {
     }
 }
 
+/// One visible tree row, copied out of the Rust explorer.
+struct Row: Identifiable {
+    let id: UInt32
+    let depth: Int
+    let node: DfNode
+    let name: String
+    let hint: String?
+}
+
 func formatBytes<T: BinaryInteger>(_ b: T) -> String {
     ByteCountFormatter.string(fromByteCount: Int64(b), countStyle: .file)
 }
@@ -37,7 +46,10 @@ final class Model {
     var scannedBytes: UInt64 = 0
     var status = ""
     var dimDays = 0
-    /// Bumped after every explorer change so views re-read rows and nodes.
+    /// Visible rows, rebuilt after every explorer change.
+    private(set) var rows: [Row] = []
+    var selection = Set<UInt32>()
+    /// Bumped after every explorer change so views re-read nodes.
     private(set) var revision = 0
 
     var sort: SortMode = .size {
@@ -71,6 +83,18 @@ final class Model {
             (scannedFiles, scannedBytes) = (files, bytes)
             try? await Task.sleep(for: .milliseconds(100))
         }
+        adopt()
+    }
+
+    /// Scan synchronously (for `--cli`).
+    func load(_ path: String) {
+        rootPath = path
+        job = df_scan_start(path)
+        adopt()
+    }
+
+    /// Take the finished (or cancelled) job's tree as the new explorer.
+    private func adopt() {
         guard let job else { return }
         let cancelled = df_scan_cancelled(job)
         let fresh = df_scan_finish(job, sort.rawValue)
@@ -83,7 +107,49 @@ final class Model {
         changed()
     }
 
-    private func changed() { revision += 1 }
+    private func changed() {
+        rows = []
+        if let ex {
+            let count = df_row_count(ex)
+            rows.reserveCapacity(count)
+            for i in 0..<count {
+                var id: UInt32 = 0, depth: UInt16 = 0
+                var n = DfNode()
+                guard df_row(ex, i, &id, &depth), df_node(ex, id, &n) else { continue }
+                rows.append(Row(id: id, depth: Int(depth), node: n, name: n.nameString, hint: n.hintString))
+            }
+            selection = selection.filter { df_is_live(ex, $0) }
+        } else {
+            selection = []
+        }
+        revision += 1
+    }
+
+    func toggle(_ id: UInt32) {
+        guard let ex, let n = node(id), n.child_count > 0 else { return }
+        df_toggle(ex, id, !n.expanded)
+        changed()
+    }
+
+    func setExpanded(_ ids: Set<UInt32>, _ open: Bool) {
+        guard let ex else { return }
+        for id in ids { if let n = node(id), n.child_count > 0 { df_toggle(ex, id, open) } }
+        changed()
+    }
+
+    /// Selection minus anything inside another selected item, so nothing counts twice.
+    func topLevel(_ ids: Set<UInt32>) -> [UInt32] {
+        guard let ex, !ids.isEmpty else { return [] }
+        let input = Array(ids)
+        var out = [UInt32](repeating: 0, count: input.count)
+        let n = df_top_level(ex, input, input.count, &out, out.count)
+        return Array(out.prefix(n))
+    }
+
+    func selectionSize() -> (count: Int, bytes: UInt64) {
+        let top = topLevel(selection)
+        return (top.count, top.reduce(0) { $0 + (node($1)?.size ?? 0) })
+    }
 
     // MARK: - Reading the tree
 
