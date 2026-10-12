@@ -4,7 +4,10 @@ A small, fast disk-usage explorer for when your disk is getting full.
 
 diskfree scans a volume or folder and shows it as an expandable tree. Every row shows the total size of everything inside it, and the largest items are listed first. You can find what is eating space and clean it up from the same window.
 
-It is written in Rust with [egui](https://github.com/emilk/egui) and runs on macOS, Linux and Windows.
+It has a Rust core and two front ends:
+
+- **egui app** ([egui](https://github.com/emilk/egui)): runs on macOS, Linux and Windows.
+- **Native macOS app** (SwiftUI): for macOS 26 and later, with Liquid Glass: glass toolbar, inspector, floating info bar and badges.
 
 ## Features
 
@@ -34,7 +37,16 @@ cargo run --release -- ~/        # scans the given path on launch
 cargo run --release -- --cli ~/  # no GUI: print the 20 largest children
 ```
 
-## Keyboard
+### Native macOS app (macOS 26+)
+
+You need the Command Line Tools with the macOS 26 SDK. Xcode is not required.
+
+```sh
+./scripts/build-mac-app.sh       # builds target/Diskfree.app
+open target/Diskfree.app
+```
+
+## Keyboard (egui app)
 
 | Key | Action |
 |---|---|
@@ -55,8 +67,6 @@ cargo run --release -- --cli ~/  # no GUI: print the 20 largest children
 - [Usage guide](docs/usage.md)
 - [Architecture](docs/architecture.md)
 - [Development](docs/development.md)
-
-A native macOS front end with SwiftUI and Liquid Glass, built on the same Rust core, is planned.
 
 ## License
 

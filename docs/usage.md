@@ -1,5 +1,7 @@
 # Using diskfree
 
+This guide describes the egui app. The native macOS app works the same way; the differences are listed in [Native macOS app](#native-macos-app).
+
 ## Scanning
 
 1. Pick a disk from the **Volume** menu. Each disk shows its free space. You can also type a path into the field next to it.
@@ -74,6 +76,21 @@ Toggle the right-hand panel with **Insights**.
   Click an entry to jump to it in the tree. **Select all** followed by Delete moves them all to the Trash. These are hints only, so check before deleting.
 - **Largest files:** the 200 largest files in the scan. Click one to jump to it.
 - **File types:** total size and file count per extension. Click one to filter the tree by that extension.
+
+## Native macOS app
+
+The macOS 26 app has the same features with native controls:
+
+- **Toolbar:** Volume menu, path field, Scan/Cancel, Sort, Insights toggle, Dim recent, and a search field that filters names.
+- **Tree:** a table with Name, Size, %, Files and Age columns.
+  - Click to select. ⌘-click and Shift-click extend the selection, and ⌘A selects all rows.
+  - Click the chevron, double-click, or press → / ← to expand or collapse folders.
+- **Actions:** right-click for Reveal in Finder, Copy Path(s), Rescan and Move to Trash…. ⌫ opens the Move to Trash confirmation for the selection. Items go to the Trash through `FileManager`, so there is no Finder automation prompt.
+- **Info bar:** a floating glass bar at the bottom shows disk usage, the selection total and status messages. While a scan runs, a glass capsule shows progress and has a cancel button.
+- **Insights:** in the right-hand inspector with Cleanup / Largest / Types tabs. Click an entry to jump to it in the tree. **Select All** (Cleanup tab) followed by ⌫ moves all hints to the Trash.
+- **Sizes** use decimal units (GB), like Finder.
+
+To scan protected folders, grant **Full Disk Access** to `Diskfree.app` itself (System Settings → Privacy & Security → Full Disk Access). Rebuilding the app changes its signature, so you may need to grant it again after a rebuild.
 
 ## Troubleshooting
 

@@ -1,6 +1,6 @@
 # Architecture
 
-diskfree is a Rust library (the core) plus the egui binary that uses it:
+diskfree is a Rust library (the core) plus two front ends: the egui binary and a native SwiftUI app in `macos/`.
 
 | File | Role |
 |---|---|
@@ -10,6 +10,10 @@ diskfree is a Rust library (the core) plus the egui binary that uses it:
 | `src/ffi.rs` + `include/diskfree.h` | C ABI over `ScanJob` and `Explorer` for the native macOS app |
 | `src/lib.rs` | Library root (`rlib` + `staticlib` → `libdiskfree.a`) |
 | `src/main.rs` | egui UI, CLI mode, OS actions (trash, reveal, clipboard, disk info) |
+| `macos/Sources/Diskfree/Model.swift` | Swift view model over the C ABI: rows, selection, insights, actions |
+| `macos/Sources/Diskfree/DiskfreeApp.swift` | SwiftUI views: toolbar, table, inspector, glass bars; `--cli` / `--selftest` |
+| `macos/Sources/DiskfreeCore/` | C module map linking `libdiskfree.a` |
+| `scripts/build-mac-app.sh` | Builds and ad-hoc signs `target/Diskfree.app` |
 
 ```
 ┌─────────────────────────── src/main.rs (egui / eframe) ───────────────────────────┐
@@ -119,7 +123,7 @@ Its methods are `toggle`, `set_sort`, `set_filter`, `reveal(id) -> row`, `remove
 - **Selection** is a `HashSet<u32>` of node ids, so it survives expanding and collapsing. `Tree::top_level()` drops ids whose ancestor is also selected, so actions never double-count or double-trash. Selected nodes that are no longer live are pruned after every change.
 - **Background jobs:** a scan or rescan is a `ScanJob` (a `std::thread`). The UI checks `ScanJob::is_done` each frame and repaints every 100 ms while a job runs. Rescans are grafted in. A cancelled rescan is discarded so it never grafts partial sizes.
 
-## Native macOS UI (Stage 6, in progress)
+## Native macOS UI
 
 ```
 SwiftUI app (macOS 26, Liquid Glass)        egui app (Linux, Windows, older macOS)
@@ -128,7 +132,19 @@ SwiftUI app (macOS 26, Liquid Glass)        egui app (Linux, Windows, older macO
    src/ffi.rs  ──────────────►  lib: scan.rs · explorer.rs · insights.rs
 ```
 
-The crate is a library (`rlib` + `staticlib`) with a small C ABI that uses opaque `DfScan`/`DfExplorer` handles (see `include/diskfree.h`). A SwiftUI app built with SwiftPM links `libdiskfree.a`. It uses native `Table` multi-select, `FileManager.trashItem` and `NSWorkspace` reveal, and gets Liquid Glass from the toolbar, the inspector and `.glassEffect()`. egui remains the cross-platform UI.
+The crate is a library (`rlib` + `staticlib`) with a small C ABI that uses opaque `DfScan`/`DfExplorer` handles (see `include/diskfree.h`). The SwiftUI app (SwiftPM, macOS 26) links `libdiskfree.a` through the `DiskfreeCore` module. egui remains the cross-platform UI.
+
+- **Model** (`@MainActor @Observable`) owns the explorer and scan pointers. After every change it copies the visible rows, candidates, largest files and types out of Rust into Swift arrays, and bumps `revision` so views re-read them. A scan is polled every 100 ms from a main-actor `Task`.
+- **Tree:** a `Table` whose rows are keyed by node id. Native ⌘/Shift multi-select is bound straight to `Set<UInt32>`.
+  - Expand/collapse calls `df_toggle`.
+  - Context menu and double-click use `contextMenu(forSelectionType:primaryAction:)`.
+  - Jumping to a node uses `df_reveal` plus `ScrollViewReader`.
+- **Actions** use native APIs:
+  - `FileManager.trashItem` (no Finder automation prompt), then `df_remove`
+  - `NSWorkspace.activateFileViewerSelecting` and `NSPasteboard`
+  - Rescan is a queue of `df_rescan_start` / `df_scan_finish_graft` jobs over the top-level selection.
+- **Liquid Glass:** the toolbar and inspector are glass automatically. Custom glass: the scan progress capsule and the info bar (`.glassEffect(.regular, in: .capsule)`), hint badges (`.regular.tint(.blue)`), and `.glass` buttons.
+- **Ownership rules:** name and hint pointers in `DfNode` are only valid until the next mutation. Swift copies names into `Row` immediately.
 
 ## Decisions and trade-offs
 

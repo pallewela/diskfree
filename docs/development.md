@@ -39,11 +39,17 @@ du -sh ~/dev ~/dev/* | sort -rh | head -5
 The SwiftUI front end lives in `macos/`, a SwiftPM package. Xcode isn't needed; the Command Line Tools with the macOS 26 SDK are enough. It links the Rust core as `target/release/libdiskfree.a` through the `DiskfreeCore` C module (`include/diskfree.h`).
 
 ```sh
+./scripts/build-mac-app.sh                 # core + Swift app -> target/Diskfree.app (ad-hoc signed)
+
+# or step by step:
 cargo build --release --lib                # rebuild the core whenever src/ changes
 cd macos && swift build -c release
 .build/release/Diskfree ~/dev              # GUI, scanning on launch
-.build/release/Diskfree --cli ~/dev        # headless check of the C ABI from Swift
+.build/release/Diskfree --cli ~/dev        # headless: view model over the C ABI, prints top rows
+.build/release/Diskfree --selftest         # headless end-to-end: trash, rescan, insights, jump on a temp dir
 ```
+
+`--selftest` moves a 1 MB `junk` folder from a temp directory to your Trash; that's part of the test.
 
 The macOS app shows sizes in decimal units (GB), like Finder. The egui app uses binary units (GiB).
 

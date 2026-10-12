@@ -9,6 +9,13 @@ enum SortMode: UInt8, CaseIterable, Identifiable {
     var label: String { ["Size", "Name", "Files"][Int(rawValue)] }
 }
 
+struct FileType: Identifiable {
+    let ext: String
+    let bytes: UInt64
+    let files: UInt64
+    var id: String { ext }
+}
+
 struct Volume: Identifiable {
     let path: String
     let name: String
@@ -50,6 +57,13 @@ final class Model {
     /// Visible rows, rebuilt after every explorer change.
     private(set) var rows: [Row] = []
     var selection = Set<UInt32>()
+    var showInsights = true
+    /// Insights, refreshed after every explorer change.
+    private(set) var candidates: [UInt32] = []
+    private(set) var largest: [UInt32] = []
+    private(set) var types: [FileType] = []
+    /// Row id the tree should scroll to (set by `jump`).
+    var scrollTarget: UInt32?
     /// Top-level ids awaiting the Move to Trash confirmation.
     var pendingTrash: [UInt32] = []
     /// Bumped after every explorer change so views re-read nodes.
@@ -137,10 +151,35 @@ final class Model {
                 rows.append(Row(id: id, depth: Int(depth), node: n, name: n.nameString, hint: n.hintString))
             }
             selection = selection.filter { df_is_live(ex, $0) }
+            candidates = ids { df_candidates(ex, $0, $1) }
+            largest = ids { df_largest(ex, $0, $1) }
+            types = (0..<df_type_count(ex)).compactMap { i in
+                var t = DfType()
+                guard df_type(ex, i, &t) else { return nil }
+                let ext = String(decoding: UnsafeBufferPointer(start: t.ext, count: t.ext_len), as: UTF8.self)
+                return FileType(ext: ext, bytes: t.bytes, files: t.files)
+            }
         } else {
-            selection = []
+            (selection, candidates, largest, types) = ([], [], [], [])
         }
         revision += 1
+    }
+
+    /// Call a "write up to cap ids, return the full count" function twice to get all ids.
+    private func ids(_ f: (UnsafeMutablePointer<UInt32>?, Int) -> Int) -> [UInt32] {
+        let n = f(nil, 0)
+        var out = [UInt32](repeating: 0, count: n)
+        _ = out.withUnsafeMutableBufferPointer { f($0.baseAddress, n) }
+        return out
+    }
+
+    /// Expand down to `id` (clearing the filter), select it and scroll to it.
+    func jump(_ id: UInt32) {
+        guard let ex else { return }
+        _ = df_reveal(ex, id)
+        if filter.isEmpty { changed() } else { filter = "" } // didSet re-applies and refreshes
+        selection = [id]
+        scrollTarget = id
     }
 
     // MARK: - Actions

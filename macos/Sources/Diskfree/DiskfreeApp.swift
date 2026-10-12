@@ -85,6 +85,12 @@ struct DiskfreeApp: App {
     while model.scanning { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
     precondition(model.rows.contains { $0.name == "new.bin" }, "rescan picks up new files")
     precondition(model.node(0)!.files == 2)
+    precondition(model.largest.first.flatMap(model.node)?.nameString == "new.bin", "largest files refreshed")
+    precondition(model.types.first?.ext == "bin")
+    model.toggle(0)
+    let newBin = model.largest.first!
+    model.jump(newBin)
+    precondition(model.rows.contains { $0.id == newBin } && model.selection == [newBin], "jump expands and selects")
     try? fm.removeItem(at: dir)
     print("selftest ok — \(trashed)")
 }
@@ -109,6 +115,9 @@ struct ContentView: View {
         }
         .toolbar { Toolbar() }
         .searchable(text: $model.filter, placement: .toolbar, prompt: "Filter names")
+        .inspector(isPresented: $model.showInsights) {
+            InsightsView().inspectorColumnWidth(min: 280, ideal: 360, max: 600)
+        }
     }
 }
 
@@ -119,49 +128,55 @@ struct TreeTable: View {
         @Bindable var model = model
         let now = UInt64(Date().timeIntervalSince1970)
         let recent = model.dimDays == 0 ? UInt64.max : now - UInt64(model.dimDays) * 86_400
-        Table(model.rows, selection: $model.selection) {
-            TableColumn("Name") { row in
-                NameCell(row: row, dimmed: row.node.mtime > recent)
+        ScrollViewReader { proxy in
+            Table(model.rows, selection: $model.selection) {
+                TableColumn("Name") { row in
+                    NameCell(row: row, dimmed: row.node.mtime > recent)
+                }
+                .width(min: 260, ideal: 480)
+                TableColumn("Size") { row in
+                    Text(formatBytes(row.node.size)).monospacedDigit()
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .width(min: 70, ideal: 90)
+                TableColumn("%") { row in
+                    let p = row.node.parent_size == 0 ? 0 : Double(row.node.size) / Double(row.node.parent_size)
+                    ProgressView(value: min(p, 1)).progressViewStyle(.linear)
+                }
+                .width(min: 60, ideal: 90)
+                TableColumn("Files") { row in
+                    Text(row.node.files, format: .number).monospacedDigit().foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .width(min: 50, ideal: 80)
+                TableColumn("Age") { row in
+                    Text(row.node.mtime == 0 ? "" : age(now &- row.node.mtime)).foregroundStyle(.secondary)
+                }
+                .width(min: 40, ideal: 55)
             }
-            .width(min: 260, ideal: 480)
-            TableColumn("Size") { row in
-                Text(formatBytes(row.node.size)).monospacedDigit()
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+            .contextMenu(forSelectionType: UInt32.self) { ids in
+                if !ids.isEmpty { RowMenu(ids: ids) }
+            } primaryAction: { ids in
+                // Double-click / Return toggles folders.
+                for id in ids { model.toggle(id) }
             }
-            .width(min: 70, ideal: 90)
-            TableColumn("%") { row in
-                let p = row.node.parent_size == 0 ? 0 : Double(row.node.size) / Double(row.node.parent_size)
-                ProgressView(value: min(p, 1)).progressViewStyle(.linear)
+            .onKeyPress(.rightArrow) { model.setExpanded(model.selection, true); return .handled }
+            .onKeyPress(.leftArrow) { model.setExpanded(model.selection, false); return .handled }
+            .onDeleteCommand { model.askTrash(model.selection) }
+            .onChange(of: model.scrollTarget) { _, id in
+                if let id { proxy.scrollTo(id, anchor: .center) }
+                model.scrollTarget = nil
             }
-            .width(min: 60, ideal: 90)
-            TableColumn("Files") { row in
-                Text(row.node.files, format: .number).monospacedDigit().foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+            .confirmationDialog(
+                trashTitle,
+                isPresented: Binding(get: { !model.pendingTrash.isEmpty }, set: { if !$0 { model.pendingTrash = [] } }),
+                titleVisibility: .visible
+            ) {
+                Button("Move to Trash", role: .destructive) { model.trashPending() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(trashMessage)
             }
-            .width(min: 50, ideal: 80)
-            TableColumn("Age") { row in
-                Text(row.node.mtime == 0 ? "" : age(now &- row.node.mtime)).foregroundStyle(.secondary)
-            }
-            .width(min: 40, ideal: 55)
-        }
-        .contextMenu(forSelectionType: UInt32.self) { ids in
-            if !ids.isEmpty { RowMenu(ids: ids) }
-        } primaryAction: { ids in
-            // Double-click / Return toggles folders.
-            for id in ids { model.toggle(id) }
-        }
-        .onKeyPress(.rightArrow) { model.setExpanded(model.selection, true); return .handled }
-        .onKeyPress(.leftArrow) { model.setExpanded(model.selection, false); return .handled }
-        .onDeleteCommand { model.askTrash(model.selection) }
-        .confirmationDialog(
-            trashTitle,
-            isPresented: Binding(get: { !model.pendingTrash.isEmpty }, set: { if !$0 { model.pendingTrash = [] } }),
-            titleVisibility: .visible
-        ) {
-            Button("Move to Trash", role: .destructive) { model.trashPending() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(trashMessage)
         }
     }
 
@@ -259,6 +274,91 @@ struct NameCell: View {
     }
 }
 
+enum InsightsTab: String, CaseIterable, Identifiable {
+    case hints = "Cleanup", largest = "Largest", types = "Types"
+    var id: String { rawValue }
+}
+
+struct InsightsView: View {
+    @Environment(Model.self) private var model
+    @State private var tab = InsightsTab.hints
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Insights", selection: $tab) {
+                ForEach(InsightsTab.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(10)
+            switch tab {
+            case .hints: hints
+            case .largest: list(model.largest, header: "Top \(model.largest.count) files")
+            case .types: types
+            }
+        }
+    }
+
+    private var hints: some View {
+        let total = model.candidates.reduce(0) { $0 + (model.node($1)?.size ?? 0) }
+        return VStack(spacing: 0) {
+            HStack {
+                Text("\(model.candidates.count) found, \(formatBytes(total))").foregroundStyle(.secondary)
+                Spacer()
+                Button("Select All") { model.selection = Set(model.candidates) }
+                    .buttonStyle(.glass)
+                    .help("Then press ⌫ to move them to the Trash")
+                    .disabled(model.candidates.isEmpty)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 6)
+            list(model.candidates, header: nil)
+        }
+    }
+
+    private func list(_ ids: [UInt32], header: String?) -> some View {
+        let root = model.path(0)
+        return List {
+            if let header { Text(header).foregroundStyle(.secondary) }
+            ForEach(ids, id: \.self) { id in
+                if let n = model.node(id) {
+                    Button { model.jump(id) } label: {
+                        HStack {
+                            Text(formatBytes(n.size)).monospacedDigit().frame(width: 72, alignment: .trailing)
+                            Text(String(model.path(id).dropFirst(root.count).drop { $0 == "/" }))
+                                .lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            if let h = n.hintString { Text(h).font(.caption).foregroundStyle(.secondary) }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .listStyle(.inset)
+    }
+
+    private var types: some View {
+        List(model.types) { t in
+            Button {
+                if t.ext != "(none)" { model.filter = ".\(t.ext)" }
+            } label: {
+                HStack {
+                    Text(formatBytes(t.bytes)).monospacedDigit().frame(width: 72, alignment: .trailing)
+                    Text(".\(t.ext)")
+                    Spacer()
+                    Text("\(t.files) files").foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Filter the tree by this extension")
+        }
+        .listStyle(.inset)
+    }
+}
+
 /// Floating glass bar: disk usage, selection total and status.
 struct InfoBar: View {
     @Environment(Model.self) private var model
@@ -339,6 +439,7 @@ struct Toolbar: ToolbarContent {
                 ForEach(SortMode.allCases) { Text($0.label).tag($0) }
             }
             .pickerStyle(.menu)
+            Toggle("Insights", systemImage: "sidebar.right", isOn: $model.showInsights)
             Menu {
                 Picker("Dim recent", selection: $model.dimDays) {
                     Text("Off").tag(0)
