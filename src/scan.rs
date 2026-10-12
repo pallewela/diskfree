@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -70,33 +70,128 @@ fn alloc_size(md: &Metadata) -> u64 {
 }
 
 /// True if this inode was already counted (hardlink). Unix only.
+type Seen = Mutex<HashSet<(u64, u64)>>;
+
 #[cfg(unix)]
-fn seen_before(md: &Metadata, seen: &mut HashSet<(u64, u64)>) -> bool {
+fn seen_before(md: &Metadata, seen: &Seen) -> bool {
     use std::os::unix::fs::MetadataExt;
-    md.nlink() > 1 && !seen.insert((md.dev(), md.ino()))
+    md.nlink() > 1 && !seen.lock().unwrap().insert((md.dev(), md.ino()))
 }
 // ponytail: Windows counts hardlinks twice; use file index via GetFileInformationByHandle if it matters.
 #[cfg(not(unix))]
-fn seen_before(_: &Metadata, _: &mut HashSet<(u64, u64)>) -> bool {
+fn seen_before(_: &Metadata, _: &Seen) -> bool {
     false
 }
 
+fn dir_node(name: Box<str>, mtime: u64) -> Node {
+    Node { name, size: 0, files: 0, parent: u32::MAX, children: Vec::new(), kind: Kind::Dir, mtime }
+}
+
+fn skipped(path: &Path) -> bool {
+    SKIP.iter().any(|s| path == Path::new(s))
+}
+
+/// Sum sizes/counts/mtime of children into `id` and sort them largest first.
+fn rollup(nodes: &mut [Node], id: u32) {
+    let mut kids = std::mem::take(&mut nodes[id as usize].children);
+    kids.sort_unstable_by_key(|&c| std::cmp::Reverse(nodes[c as usize].size));
+    let size = kids.iter().map(|&c| nodes[c as usize].size).sum();
+    let files = kids.iter().map(|&c| nodes[c as usize].files).sum();
+    let newest = kids.iter().map(|&c| nodes[c as usize].mtime).max().unwrap_or(0);
+    let n = &mut nodes[id as usize];
+    n.children = kids;
+    n.size = size;
+    n.files = files;
+    n.mtime = n.mtime.max(newest);
+}
+
+/// One directory's contents, read by a worker thread.
+enum Entry {
+    Dir(Box<str>, u64, PathBuf),    // name, mtime, path to read next
+    Leaf(Box<str>, Kind, u64, u64), // name, kind, size, mtime
+}
+
+/// Worker side: the slow part (read_dir + stat). `None` = permission denied / unreadable.
+fn read_entries(dir: &Path, p: &Progress, seen: &Seen) -> Option<Vec<Entry>> {
+    if p.cancel.load(Relaxed) {
+        return Some(Vec::new());
+    }
+    *p.current.lock().unwrap() = dir.to_string_lossy().into_owned();
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        // DirEntry::metadata does not follow symlinks.
+        let Ok(md) = entry.metadata() else { continue };
+        let name: Box<str> = entry.file_name().to_string_lossy().into();
+        if md.is_dir() {
+            let path = entry.path();
+            if !skipped(&path) {
+                out.push(Entry::Dir(name, mtime(&md), path));
+            }
+        } else {
+            let kind = if md.is_symlink() { Kind::Symlink } else { Kind::File };
+            let size = if seen_before(&md, seen) { 0 } else { alloc_size(&md) };
+            p.files.fetch_add(1, Relaxed);
+            p.bytes.fetch_add(size, Relaxed);
+            out.push(Entry::Leaf(name, kind, size, mtime(&md)));
+        }
+    }
+    Some(out)
+}
+
 impl Tree {
+    /// Worker threads read directories; this thread appends every node to the arena exactly once
+    /// (no subtree copying), then sizes are rolled up in one reverse pass.
     pub fn scan(root: &Path, p: &Progress) -> Tree {
-        let mut t = Tree {
-            nodes: vec![Node {
-                name: root.to_string_lossy().into(),
-                size: 0,
-                files: 0,
-                parent: u32::MAX,
-                children: Vec::new(),
-                kind: Kind::Dir,
-                mtime: 0,
-            }],
-            root: root.to_path_buf(),
-        };
-        let mut seen = HashSet::new();
-        t.walk(root, 0, p, &mut seen);
+        let mut t = Tree { nodes: vec![dir_node(root.to_string_lossy().into(), 0)], root: root.to_path_buf() };
+        let seen: Seen = Mutex::new(HashSet::new());
+        let (job_tx, job_rx) = mpsc::channel::<(u32, PathBuf)>();
+        let job_rx = Mutex::new(job_rx);
+        let (res_tx, res_rx) = mpsc::channel();
+        // Measured on an 18-core Mac scanning /: 4 thr 29s, 8 thr 20s, 12+ thr no faster (kernel
+        // FS lock contention). Sequential was 55s.
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                let (res_tx, job_rx, seen) = (res_tx.clone(), &job_rx, &seen);
+                s.spawn(move || {
+                    loop {
+                        // Bind first: in `while let` the guard would live through the body and serialize workers.
+                        let job = job_rx.lock().unwrap().recv();
+                        let Ok((id, path)) = job else { break };
+                        let _ = res_tx.send((id, read_entries(&path, p, seen)));
+                    }
+                });
+            }
+            job_tx.send((0, root.to_path_buf())).unwrap();
+            let mut pending = 1;
+            while pending > 0 {
+                let (id, entries) = res_rx.recv().unwrap();
+                pending -= 1;
+                let Some(entries) = entries else {
+                    t.nodes[id as usize].kind = Kind::Denied;
+                    continue;
+                };
+                for e in entries {
+                    match e {
+                        Entry::Dir(name, mtime, path) => {
+                            let c = t.push(name, id, Kind::Dir, 0, mtime);
+                            job_tx.send((c, path)).unwrap();
+                            pending += 1;
+                        }
+                        Entry::Leaf(name, kind, size, mtime) => {
+                            t.push(name, id, kind, size, mtime);
+                        }
+                    }
+                }
+            }
+            drop(job_tx); // workers' recv() fails -> they exit
+        });
+        // Children always have higher ids than parents, so reverse order is a valid post-order.
+        for id in (0..t.nodes.len() as u32).rev() {
+            if !t.nodes[id as usize].children.is_empty() {
+                rollup(&mut t.nodes, id);
+            }
+        }
         t
     }
 
@@ -106,49 +201,6 @@ impl Tree {
         self.nodes.push(Node { name, size, files, parent, children: Vec::new(), kind, mtime });
         self.nodes[parent as usize].children.push(id);
         id
-    }
-
-    fn walk(&mut self, dir: &Path, id: u32, p: &Progress, seen: &mut HashSet<(u64, u64)>) {
-        if p.cancel.load(Relaxed) {
-            return;
-        }
-        *p.current.lock().unwrap() = dir.to_string_lossy().into_owned();
-        let Ok(rd) = fs::read_dir(dir) else {
-            self.nodes[id as usize].kind = Kind::Denied;
-            return;
-        };
-        for entry in rd.flatten() {
-            // DirEntry::metadata does not follow symlinks.
-            let Ok(md) = entry.metadata() else { continue };
-            let name: Box<str> = entry.file_name().to_string_lossy().into();
-            let ft = md.file_type();
-            if ft.is_dir() {
-                let path = entry.path();
-                if SKIP.iter().any(|s| path == Path::new(s)) {
-                    continue;
-                }
-                let child = self.push(name, id, Kind::Dir, 0, mtime(&md));
-                self.walk(&path, child, p, seen);
-            } else {
-                let kind = if ft.is_symlink() { Kind::Symlink } else { Kind::File };
-                let size = if seen_before(&md, seen) { 0 } else { alloc_size(&md) };
-                self.push(name, id, kind, size, mtime(&md));
-                p.files.fetch_add(1, Relaxed);
-                p.bytes.fetch_add(size, Relaxed);
-            }
-        }
-        // Roll up and sort largest first.
-        let mut kids = std::mem::take(&mut self.nodes[id as usize].children);
-        kids.sort_unstable_by_key(|&c| std::cmp::Reverse(self.nodes[c as usize].size));
-        let n = &self.nodes;
-        let size = kids.iter().map(|&c| n[c as usize].size).sum();
-        let files = kids.iter().map(|&c| n[c as usize].files).sum();
-        let newest = kids.iter().map(|&c| n[c as usize].mtime).max().unwrap_or(0);
-        let n = &mut self.nodes[id as usize];
-        n.children = kids;
-        n.size = size;
-        n.files = files;
-        n.mtime = n.mtime.max(newest);
     }
 
     pub fn sort_children(&mut self, id: u32, by: Sort) {
@@ -263,7 +315,8 @@ mod tests {
     fn totals_order_links() {
         let d = std::env::temp_dir().join(format!("diskfree-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(d.join("big/inner")).unwrap();
+        fs::create_dir_all(d.join("big/inner/d1/d2")).unwrap();
+        fs::write(d.join("big/inner/d1/d2/c.bin"), vec![1u8; 30_000]).unwrap();
         fs::create_dir_all(d.join("small")).unwrap();
         fs::create_dir_all(d.join("outside")).unwrap();
         fs::write(d.join("big/inner/a.bin"), vec![1u8; 200_000]).unwrap();
@@ -283,19 +336,22 @@ mod tests {
         let t = Tree::scan(&scan_root, &Progress::default());
         let a = alloc_size(&fs::metadata(scan_root.join("big/inner/a.bin")).unwrap());
         let b = alloc_size(&fs::metadata(scan_root.join("small/b.bin")).unwrap());
+        let c = alloc_size(&fs::metadata(scan_root.join("big/inner/d1/d2/c.bin")).unwrap());
         let root = &t.nodes[0];
         let names: Vec<&str> = root.children.iter().map(|&c| &*t.nodes[c as usize].name).collect();
         assert_eq!(names[0], "big", "largest first: {names:?}");
         // Symlink not followed (no 500 KB), hardlink counted once.
         let link = if cfg!(unix) { alloc_size(&fs::symlink_metadata(scan_root.join("link")).unwrap()) } else { 0 };
-        assert_eq!(root.size, a + b + link);
-        assert_eq!(t.path(t.nodes[root.children[0] as usize].children[0]), scan_root.join("big/inner"));
+        assert_eq!(root.size, a + b + c + link);
+        let big = &t.nodes[root.children[0] as usize];
+        let inner = *big.children.iter().find(|&&c| &*t.nodes[c as usize].name == "inner").unwrap();
+        assert_eq!(t.path(inner), scan_root.join("big/inner"));
 
         // Remove "small", then rescan "big" after deleting one of its files.
         let mut t = t;
         let small = t.nodes[0].children[1];
         t.remove(small, Sort::Size);
-        assert_eq!(t.nodes[0].size, a + link);
+        assert_eq!(t.nodes[0].size, a + c + link);
         assert!(!t.is_live(small));
         fs::remove_file(scan_root.join("big/inner/a.bin")).unwrap();
         let big = t.nodes[0].children[0];
