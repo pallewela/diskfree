@@ -1,13 +1,10 @@
-mod insights;
-mod scan;
-
+use diskfree::explorer::Explorer;
+use diskfree::insights;
+use diskfree::scan::{fmt_size, Kind, Progress, ScanJob, Sort, Tree};
 use eframe::egui;
-use scan::{fmt_size, Kind, Progress, Sort, Tree};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
-use std::thread::JoinHandle;
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
@@ -43,8 +40,7 @@ fn cli(root: &str) {
 }
 
 struct Job {
-    progress: Arc<Progress>,
-    handle: JoinHandle<Vec<Tree>>,
+    scan: ScanJob,
     targets: Vec<u32>, // empty = full scan, else rescan these subtrees
 }
 
@@ -58,22 +54,17 @@ enum Side {
 struct App {
     root_input: String,
     disks: sysinfo::Disks,
-    tree: Option<Tree>,
+    ex: Option<Explorer>,
     sort: Sort,
-    expanded: Vec<bool>,
-    rows: Vec<(u32, u16)>, // (node id, depth) of currently visible rows
-    selected: usize,    // cursor row
-    sel: HashSet<u32>,  // selected node ids
-    anchor: usize,      // row where shift-click ranges start
+    selected: usize,   // cursor row
+    sel: HashSet<u32>, // selected node ids
+    anchor: usize,     // row where shift-click ranges start
     job: Option<Job>,
     status: String,
     visible: std::ops::Range<usize>,
     scroll_to: Option<f32>,
     filter: String,
-    hit: Vec<bool>, // name matches filter
-    anc: Vec<bool>, // has a matching descendant
     confirm_trash: Option<Vec<u32>>,
-    stats: insights::Stats,
     show_side: bool,
     side: Side,
     age_days: u64, // dim rows changed within this many days; 0 = off
@@ -84,10 +75,8 @@ impl Default for App {
         Self {
             root_input: if cfg!(windows) { "C:\\".into() } else { "/".into() },
             disks: sysinfo::Disks::new_with_refreshed_list(),
-            tree: None,
+            ex: None,
             sort: Sort::Size,
-            expanded: Vec::new(),
-            rows: Vec::new(),
             selected: 0,
             sel: HashSet::new(),
             anchor: 0,
@@ -96,10 +85,7 @@ impl Default for App {
             visible: 0..0,
             scroll_to: None,
             filter: String::new(),
-            hit: Vec::new(),
-            anc: Vec::new(),
             confirm_trash: None,
-            stats: Default::default(),
             show_side: true,
             side: Side::Candidates,
             age_days: 0,
@@ -109,39 +95,29 @@ impl Default for App {
 
 impl App {
     fn start_scan(&mut self, targets: Vec<u32>) {
-        let roots: Vec<PathBuf> = match &self.tree {
-            Some(t) if !targets.is_empty() => targets.iter().map(|&id| t.path(id)).collect(),
+        let roots: Vec<PathBuf> = match &self.ex {
+            Some(ex) if !targets.is_empty() => targets.iter().map(|&id| ex.tree.path(id)).collect(),
             _ => vec![PathBuf::from(self.root_input.trim())],
         };
-        let progress = Arc::new(Progress::default());
-        let p = progress.clone();
-        let handle = std::thread::spawn(move || roots.iter().map(|r| Tree::scan(r, &p)).collect());
-        self.job = Some(Job { progress, handle, targets });
+        self.job = Some(Job { scan: ScanJob::start(roots), targets });
         self.status.clear();
     }
 
     fn finish_scan(&mut self) {
         let job = self.job.take().unwrap();
-        let subs = job.handle.join().expect("scan thread panicked");
-        let cancelled = job.progress.cancel.load(Relaxed);
-        match &mut self.tree {
+        let cancelled = job.scan.cancelled();
+        let subs = job.scan.finish();
+        match &mut self.ex {
             // A cancelled rescan would graft partial sizes; keep the old data instead.
             Some(_) if cancelled && !job.targets.is_empty() => self.status = "Rescan cancelled.".into(),
-            Some(t) if !job.targets.is_empty() => {
-                for (id, sub) in job.targets.into_iter().zip(subs) {
-                    t.graft(id, sub, self.sort);
-                }
-            }
+            Some(ex) if !job.targets.is_empty() => ex.graft(job.targets.into_iter().zip(subs).collect()),
             _ => {
                 if cancelled {
                     self.status = "Scan cancelled — showing partial results.".into();
                 }
-                let mut t = subs.into_iter().next().unwrap();
-                if self.sort != Sort::Size {
-                    t.sort_all(self.sort);
-                }
-                self.tree = Some(t);
-                self.expanded.clear();
+                let mut ex = Explorer::new(subs.into_iter().next().unwrap(), self.sort);
+                ex.set_filter(&self.filter);
+                self.ex = Some(ex);
                 self.selected = 0;
                 self.sel.clear();
             }
@@ -151,29 +127,17 @@ impl App {
 
     /// Call after the arena grew or nodes were removed.
     fn after_tree_change(&mut self) {
-        let len = self.tree.as_ref().map_or(0, |t| t.nodes.len());
-        self.expanded.resize(len, false);
-        if let Some(t) = &self.tree {
-            self.sel.retain(|&id| t.is_live(id));
+        if let Some(ex) = &self.ex {
+            self.sel.retain(|&id| ex.tree.is_live(id));
+            self.selected = self.selected.min(ex.rows.len().saturating_sub(1));
         }
         self.disks.refresh(true);
-        self.apply_filter();
-        if let Some(t) = &self.tree {
-            self.stats = insights::compute(t);
-        }
     }
 
-    /// Expand down to `id`, select it and scroll it into view.
     fn jump(&mut self, id: u32) {
-        let Some(t) = &self.tree else { return };
-        let mut p = t.nodes[id as usize].parent;
-        while p != u32::MAX {
-            self.expanded[p as usize] = true;
-            p = t.nodes[p as usize].parent;
-        }
+        let Some(ex) = &mut self.ex else { return };
         self.filter.clear();
-        self.apply_filter();
-        if let Some(i) = self.rows.iter().position(|r| r.0 == id) {
+        if let Some(i) = ex.reveal(id) {
             self.selected = i;
             self.anchor = i;
             self.sel = HashSet::from([id]);
@@ -181,73 +145,28 @@ impl App {
         }
     }
 
-    fn apply_filter(&mut self) {
-        let Some(t) = &self.tree else { return };
-        let q = self.filter.trim().to_lowercase();
-        self.hit = vec![false; t.nodes.len()];
-        self.anc = vec![false; t.nodes.len()];
-        if !q.is_empty() {
-            // Pre-order over live nodes, then fold matches up to parents in reverse.
-            let mut order = Vec::new();
-            let mut stack = vec![0u32];
-            while let Some(id) = stack.pop() {
-                order.push(id);
-                stack.extend(&t.nodes[id as usize].children);
-            }
-            for &id in order.iter().rev() {
-                let i = id as usize;
-                self.hit[i] = id != 0 && t.nodes[i].name.to_lowercase().contains(&q);
-                if (self.hit[i] || self.anc[i]) && id != 0 {
-                    let p = t.nodes[i].parent as usize;
-                    self.anc[p] = true;
-                    self.expanded[p] = true;
-                }
-            }
-        }
-        self.rebuild_rows();
-    }
-
-    fn rebuild_rows(&mut self) {
-        self.rows.clear();
-        let Some(t) = &self.tree else { return };
-        let filtering = !self.filter.trim().is_empty();
-        // `inside`: under a matching node, so show its subtree unfiltered.
-        let mut stack = vec![(0u32, 0u16, !filtering)];
-        while let Some((id, d, inside)) = stack.pop() {
-            self.rows.push((id, d));
-            let i = id as usize;
-            if self.expanded[i] {
-                let inside = inside || self.hit[i];
-                for &c in t.nodes[i].children.iter().rev() {
-                    if inside || self.hit[c as usize] || self.anc[c as usize] {
-                        stack.push((c, d + 1, inside));
-                    }
-                }
-            }
-        }
-        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
-    }
-
     fn toggle(&mut self, id: u32, open: bool) {
-        self.expanded[id as usize] = open;
-        self.rebuild_rows();
+        if let Some(ex) = &mut self.ex {
+            ex.toggle(id, open);
+            self.selected = self.selected.min(ex.rows.len().saturating_sub(1));
+        }
     }
 
     fn trash_all(&mut self, ids: Vec<u32>) {
-        let Some(t) = &mut self.tree else { return };
-        let (mut n, mut bytes, mut errs) = (0, 0, Vec::new());
+        let Some(ex) = &mut self.ex else { return };
+        let (mut gone, mut bytes, mut errs) = (Vec::new(), 0, Vec::new());
         for id in ids {
-            let path = t.path(id);
+            let path = ex.tree.path(id);
             match trash::delete(&path) {
                 Ok(()) => {
-                    n += 1;
-                    bytes += t.nodes[id as usize].size;
-                    t.remove(id, self.sort);
+                    gone.push(id);
+                    bytes += ex.tree.nodes[id as usize].size;
                 }
                 Err(e) => errs.push(format!("{}: {e}", path.display())),
             }
         }
-        self.status = format!("Moved {n} item(s), {}, to Trash.", fmt_size(bytes));
+        ex.remove(&gone);
+        self.status = format!("Moved {} item(s), {}, to Trash.", gone.len(), fmt_size(bytes));
         if let Some(e) = errs.first() {
             self.status += &format!(" {} failed — {e}", errs.len());
         }
@@ -256,29 +175,30 @@ impl App {
 
     /// Selected ids for actions: top-level selection, or the cursor row if nothing is selected.
     fn action_ids(&self) -> Vec<u32> {
-        let Some(t) = &self.tree else { return vec![] };
-        let ids = top_level(t, &self.sel);
-        if ids.is_empty() { self.rows.get(self.selected).map(|r| r.0).into_iter().collect() } else { ids }
+        let Some(ex) = &self.ex else { return vec![] };
+        let ids = ex.tree.top_level(&self.sel);
+        if ids.is_empty() { ex.rows.get(self.selected).map(|r| r.0).into_iter().collect() } else { ids }
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
-        let Some(t) = &self.tree else { return };
-        if self.rows.is_empty() || ctx.egui_wants_keyboard_input() || self.confirm_trash.is_some() {
+        let Some(ex) = &self.ex else { return };
+        if ex.rows.is_empty() || ctx.egui_wants_keyboard_input() || self.confirm_trash.is_some() {
             return;
         }
-        let (id, _) = self.rows[self.selected];
-        let n = &t.nodes[id as usize];
+        let (id, _) = ex.rows[self.selected];
+        let n = &ex.tree.nodes[id as usize];
         let has_kids = !n.children.is_empty();
-        let open = self.expanded[id as usize];
+        let open = ex.expanded[id as usize];
         let parent = n.parent;
         let key = |k| ctx.input(|i| i.key_pressed(k));
         let shift = ctx.input(|i| i.modifiers.shift);
         let before = self.selected;
+        let last = ex.rows.len() - 1;
         if key(egui::Key::ArrowUp) {
             self.selected = self.selected.saturating_sub(1);
         }
         if key(egui::Key::ArrowDown) {
-            self.selected = (self.selected + 1).min(self.rows.len() - 1);
+            self.selected = (self.selected + 1).min(last);
         }
         if key(egui::Key::ArrowRight) && has_kids && !open {
             self.toggle(id, true);
@@ -286,12 +206,13 @@ impl App {
         if key(egui::Key::ArrowLeft) {
             if open {
                 self.toggle(id, false);
-            } else if let Some(i) = self.rows.iter().position(|&(r, _)| r == parent) {
+            } else if let Some(i) = self.ex.as_ref().unwrap().rows.iter().position(|&(r, _)| r == parent) {
                 self.selected = i;
             }
         }
+        let rows = &self.ex.as_ref().unwrap().rows;
         if self.selected != before {
-            let nid = self.rows[self.selected].0;
+            let nid = rows[self.selected].0;
             if shift {
                 self.sel.insert(nid);
             } else {
@@ -300,7 +221,7 @@ impl App {
             }
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
-            self.sel = self.rows.iter().map(|r| r.0).collect();
+            self.sel = rows.iter().map(|r| r.0).collect();
         }
         if key(egui::Key::Escape) {
             self.sel.clear();
@@ -340,29 +261,27 @@ impl App {
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if let Some(j) = &self.job {
                 if ui.button("Cancel").clicked() {
-                    j.progress.cancel.store(true, Relaxed);
+                    j.scan.cancel();
                 }
             } else if ui.button("Scan").clicked() || enter {
                 self.start_scan(vec![]);
             }
             ui.separator();
             ui.label("Sort:");
-            let before = self.sort;
             ui.add_enabled_ui(!busy, |ui| {
                 ui.selectable_value(&mut self.sort, Sort::Size, "Size");
                 ui.selectable_value(&mut self.sort, Sort::Name, "Name");
                 ui.selectable_value(&mut self.sort, Sort::Files, "Files");
             });
-            if self.sort != before {
-                if let Some(t) = &mut self.tree {
-                    t.sort_all(self.sort);
-                    self.rebuild_rows();
-                }
+            if let Some(ex) = &mut self.ex {
+                ex.set_sort(self.sort);
             }
             ui.separator();
             let f = ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("filter names…").desired_width(160.0));
             if f.changed() {
-                self.apply_filter();
+                if let Some(ex) = &mut self.ex {
+                    ex.set_filter(&self.filter);
+                }
             }
             let age = |d: u64| if d == 0 { "Dim recent: off".to_string() } else { format!("Dim changed < {d}d") };
             egui::ComboBox::from_id_salt("age").selected_text(age(self.age_days)).show_ui(ui, |ui| {
@@ -374,7 +293,7 @@ impl App {
         });
         ui.horizontal(|ui| {
             if let Some(j) = &self.job {
-                let p = &j.progress;
+                let p = &j.scan.progress;
                 ui.label(format!(
                     "Scanning… {} files, {} — {}",
                     p.files.load(Relaxed),
@@ -384,7 +303,7 @@ impl App {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
                 return;
             }
-            if let Some(d) = self.tree.as_ref().and_then(|t| self.disk_for(&t.root)) {
+            if let Some(d) = self.ex.as_ref().and_then(|ex| self.disk_for(&ex.tree.root)) {
                 let (total, free) = (d.total_space(), d.available_space());
                 ui.label(format!(
                     "{}: {} used of {}, {} free",
@@ -395,10 +314,10 @@ impl App {
                 ));
                 ui.add(egui::ProgressBar::new(1.0 - free as f32 / total.max(1) as f32).desired_width(120.0));
             }
-            if let Some(t) = &self.tree {
-                let ids = top_level(t, &self.sel);
+            if let Some(ex) = &self.ex {
+                let ids = ex.tree.top_level(&self.sel);
                 if !ids.is_empty() {
-                    let size: u64 = ids.iter().map(|&id| t.nodes[id as usize].size).sum();
+                    let size: u64 = ids.iter().map(|&id| ex.tree.nodes[id as usize].size).sum();
                     ui.separator();
                     ui.label(egui::RichText::new(format!("{} selected, {}", ids.len(), fmt_size(size))).strong());
                 }
@@ -408,10 +327,11 @@ impl App {
     }
 
     fn tree_view(&mut self, ui: &mut egui::Ui) {
-        let Some(t) = &self.tree else {
+        let Some(ex) = &self.ex else {
             ui.label("Pick a volume or type a path, then press Scan.");
             return;
         };
+        let t = &ex.tree;
         let busy = self.job.is_some();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let recent = now.saturating_sub(self.age_days * 86_400);
@@ -423,9 +343,9 @@ impl App {
         }
         let mut toggle = None;
         let mut rescan = Vec::new();
-        let out = area.show_rows(ui, row_h, self.rows.len(), |ui, range| {
+        let out = area.show_rows(ui, row_h, ex.rows.len(), |ui, range| {
             for i in range.clone() {
-                let (id, depth) = self.rows[i];
+                let (id, depth) = ex.rows[i];
                 let n = &t.nodes[id as usize];
                 let parent_size = t.nodes.get(n.parent as usize).map_or(n.size, |p| p.size);
                 let frac = if parent_size == 0 { 0.0 } else { n.size as f32 / parent_size as f32 };
@@ -436,7 +356,7 @@ impl App {
                     let age = if n.mtime == 0 { String::new() } else { insights::fmt_age(now.saturating_sub(n.mtime)) };
                     ui.add_sized([45.0, row_h], egui::Label::new(egui::RichText::new(age).weak()));
                     ui.add_space(depth as f32 * 14.0);
-                    let open = self.expanded[id as usize];
+                    let open = ex.expanded[id as usize];
                     let arrow = match (n.kind, n.children.is_empty(), open) {
                         (Kind::Denied, ..) => "🔒",
                         (_, true, _) => " ",
@@ -449,7 +369,7 @@ impl App {
                         Kind::File => format!("{arrow} {}", n.name),
                     };
                     let mut text = egui::RichText::new(label);
-                    if self.hit.get(id as usize) == Some(&true) {
+                    if ex.hit[id as usize] {
                         text = text.strong().color(ui.visuals().warn_fg_color);
                     } else if self.age_days > 0 && n.mtime > recent {
                         text = text.color(ui.visuals().weak_text_color());
@@ -459,8 +379,8 @@ impl App {
                     if r.clicked() {
                         let m = ui.input(|i| i.modifiers);
                         if m.shift {
-                            let a = self.anchor.min(self.rows.len() - 1);
-                            self.sel = self.rows[a.min(i)..=a.max(i)].iter().map(|r| r.0).collect();
+                            let a = self.anchor.min(ex.rows.len() - 1);
+                            self.sel = ex.rows[a.min(i)..=a.max(i)].iter().map(|r| r.0).collect();
                         } else if m.command {
                             if !self.sel.remove(&id) {
                                 self.sel.insert(id);
@@ -481,7 +401,7 @@ impl App {
                         self.selected = i;
                     }
                     r.context_menu(|ui| {
-                        let ids = top_level(t, &self.sel);
+                        let ids = t.top_level(&self.sel);
                         let many = if ids.len() > 1 { format!(" ({} items)", ids.len()) } else { String::new() };
                         if ui.button(format!("Reveal in file manager{many}")).clicked() {
                             for &id in &ids {
@@ -529,10 +449,11 @@ impl App {
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(t) = &self.tree else {
+        let Some(ex) = &self.ex else {
             ui.label("Scan first.");
             return;
         };
+        let (t, stats) = (&ex.tree, &ex.stats);
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.side, Side::Candidates, "Cleanup hints");
@@ -545,14 +466,14 @@ impl App {
         let (mut jump, mut filter) = (None, None);
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.side {
             Side::Candidates => {
-                let total: u64 = self.stats.candidates.iter().map(|c| t.nodes[c.0 as usize].size).sum();
+                let total: u64 = stats.candidates.iter().map(|c| t.nodes[c.0 as usize].size).sum();
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} found, {}", self.stats.candidates.len(), fmt_size(total)));
+                    ui.label(format!("{} found, {}", stats.candidates.len(), fmt_size(total)));
                     if ui.button("Select all").on_hover_text("Then press Delete to trash them").clicked() {
-                        self.sel = self.stats.candidates.iter().map(|c| c.0).collect();
+                        self.sel = stats.candidates.iter().map(|c| c.0).collect();
                     }
                 });
-                for &(id, h) in &self.stats.candidates {
+                for &(id, h) in &stats.candidates {
                     let r = ui.selectable_label(self.sel.contains(&id), row(t.nodes[id as usize].size, format!("{}  [{h}]", rel(id))));
                     if r.clicked() {
                         jump = Some(id);
@@ -561,14 +482,14 @@ impl App {
             }
             Side::Largest => {
                 ui.label(format!("Top {} files", insights::TOP_FILES));
-                for &id in &self.stats.largest {
+                for &id in &stats.largest {
                     if ui.selectable_label(self.sel.contains(&id), row(t.nodes[id as usize].size, rel(id))).clicked() {
                         jump = Some(id);
                     }
                 }
             }
             Side::Types => {
-                for (ext, bytes, files) in &self.stats.types {
+                for (ext, bytes, files) in &stats.types {
                     let r = ui.selectable_label(false, row(*bytes, format!(".{ext}  ({files} files)")));
                     if r.on_hover_text("Filter the tree by this extension").clicked() && ext != "(none)" {
                         filter = Some(format!(".{ext}"));
@@ -579,14 +500,15 @@ impl App {
         if let Some(id) = jump {
             self.jump(id);
         }
-        if let Some(f) = filter {
+        if let (Some(f), Some(ex)) = (filter, &mut self.ex) {
+            ex.set_filter(&f);
             self.filter = f;
-            self.apply_filter();
         }
     }
 
     fn trash_dialog(&mut self, ctx: &egui::Context) {
-        let (Some(ids), Some(t)) = (&self.confirm_trash, &self.tree) else { return };
+        let (Some(ids), Some(ex)) = (&self.confirm_trash, &self.ex) else { return };
+        let t = &ex.tree;
         let size: u64 = ids.iter().map(|&id| t.nodes[id as usize].size).sum();
         let files: u64 = ids.iter().map(|&id| t.nodes[id as usize].files).sum();
         let mut answer = None;
@@ -618,30 +540,10 @@ impl App {
     }
 }
 
-/// Selected ids whose ancestors are not also selected (so nothing is counted or trashed twice).
-fn top_level(t: &Tree, sel: &HashSet<u32>) -> Vec<u32> {
-    let mut v: Vec<u32> = sel
-        .iter()
-        .copied()
-        .filter(|&id| {
-            let mut p = t.nodes[id as usize].parent;
-            while p != u32::MAX {
-                if sel.contains(&p) {
-                    return false;
-                }
-                p = t.nodes[p as usize].parent;
-            }
-            true
-        })
-        .collect();
-    v.sort_unstable();
-    v
-}
-
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
-        if self.job.as_ref().is_some_and(|j| j.handle.is_finished()) {
+        if self.job.as_ref().is_some_and(|j| j.scan.is_done()) {
             self.finish_scan();
         }
         self.keys(ctx);
@@ -651,22 +553,5 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default().show(ui, |ui| self.tree_view(ui));
         self.trash_dialog(ctx);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn top_level_drops_nested() {
-        // 0 -> 1 -> 2, 0 -> 3
-        let node = |parent, children| scan::Node { name: "x".into(), size: 1, files: 1, parent, children, kind: Kind::Dir, mtime: 0 };
-        let t = Tree {
-            nodes: vec![node(u32::MAX, vec![1, 3]), node(0, vec![2]), node(1, vec![]), node(0, vec![])],
-            root: PathBuf::from("/"),
-        };
-        assert_eq!(top_level(&t, &HashSet::from([1, 2, 3])), vec![1, 3]);
-        assert_eq!(top_level(&t, &HashSet::from([0, 2])), vec![0]);
     }
 }

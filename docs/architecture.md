@@ -1,11 +1,14 @@
 # Architecture
 
-diskfree is one Rust binary with three source files:
+diskfree is a Rust library (the core) plus the egui binary that uses it:
 
 | File | Role |
 |---|---|
-| `src/scan.rs` | Core: tree model (arena), parallel scanner, mutations (remove, graft, sort) |
+| `src/scan.rs` | Core: tree model (arena), parallel scanner, `ScanJob`, mutations (remove, graft, sort), `top_level` |
+| `src/explorer.rs` | Core: UI-agnostic browsing state: expanded set, filter marks, visible rows, insights |
 | `src/insights.rs` | Core: cleanup hints, largest files, per-extension totals, age formatting |
+| `src/ffi.rs` + `include/diskfree.h` | C ABI over `ScanJob` and `Explorer` for the native macOS app |
+| `src/lib.rs` | Library root (`rlib` + `staticlib` → `libdiskfree.a`) |
 | `src/main.rs` | egui UI, CLI mode, OS actions (trash, reveal, clipboard, disk info) |
 
 ```
@@ -96,23 +99,36 @@ The arena keeps these invariants:
 
 It is recomputed in full after every tree change. A `ponytail:` comment marks this as the place to switch to incremental updates if it gets slow.
 
+## Explorer (shared browsing state)
+
+`Explorer` owns the `Tree` plus everything derived from it, so every UI behaves the same:
+
+- `expanded: Vec<bool>`
+- filter marks `hit` / `anc`
+- `rows: Vec<(id, depth)>`
+- `stats` (insights)
+
+Its methods are `toggle`, `set_sort`, `set_filter`, `reveal(id) -> row`, `remove(ids)` and `graft(subs)`. Each one keeps the rows, marks and stats consistent.
+
+- **Rows:** `rebuild_rows` flattens the expanded tree into the visible rows.
+- **Filter:** a pre-order walk of the live nodes, folded in reverse, marks `hit` (the name matches) and `anc` (has a matching descendant). Ancestors auto-expand, and a matching folder shows its whole subtree.
+
 ## UI (egui)
 
-- **Virtualized rows:** `rebuild_rows` flattens the expanded tree into `rows: Vec<(id, depth)>`, and `ScrollArea::show_rows` draws only the visible rows. Expanding or collapsing rebuilds the list.
-- **Selection** is a `HashSet<u32>` of node ids, so it survives expanding and collapsing. `top_level()` drops ids whose ancestor is also selected, so actions never double-count or double-trash. Selected nodes that are no longer live are pruned after every change.
-- **Filter:** a pre-order walk of the live nodes, folded in reverse, marks `hit` (the name matches) and `anc` (has a matching descendant). Ancestors auto-expand, and a matching folder shows its whole subtree.
-- **Background jobs:** a scan or rescan runs on a `std::thread`. The UI checks `JoinHandle::is_finished` each frame and repaints every 100 ms while a job runs. Rescans are grafted in. A cancelled rescan is discarded so it never grafts partial sizes.
+- **Virtualized rows:** `ScrollArea::show_rows` draws only the visible part of `Explorer::rows`.
+- **Selection** is a `HashSet<u32>` of node ids, so it survives expanding and collapsing. `Tree::top_level()` drops ids whose ancestor is also selected, so actions never double-count or double-trash. Selected nodes that are no longer live are pruned after every change.
+- **Background jobs:** a scan or rescan is a `ScanJob` (a `std::thread`). The UI checks `ScanJob::is_done` each frame and repaints every 100 ms while a job runs. Rescans are grafted in. A cancelled rescan is discarded so it never grafts partial sizes.
 
-## Planned: native macOS UI (Stage 6)
+## Native macOS UI (Stage 6, in progress)
 
 ```
 SwiftUI app (macOS 26, Liquid Glass)        egui app (Linux, Windows, older macOS)
         │  C ABI (include/diskfree.h)                 │  Rust API
         ▼                                             ▼
-   src/ffi.rs  ──────────────►  lib: scan.rs · insights.rs · shared selection/filter helpers
+   src/ffi.rs  ──────────────►  lib: scan.rs · explorer.rs · insights.rs
 ```
 
-The crate becomes a library (`rlib` + `staticlib`) with a small C ABI that uses opaque `Tree`/scan handles. A SwiftUI app built with SwiftPM links `libdiskfree.a`. It uses native `Table` multi-select, `FileManager.trashItem` and `NSWorkspace` reveal, and gets Liquid Glass from the toolbar, the inspector and `.glassEffect()`. egui remains the cross-platform UI.
+The crate is a library (`rlib` + `staticlib`) with a small C ABI that uses opaque `DfScan`/`DfExplorer` handles (see `include/diskfree.h`). A SwiftUI app built with SwiftPM links `libdiskfree.a`. It uses native `Table` multi-select, `FileManager.trashItem` and `NSWorkspace` reveal, and gets Liquid Glass from the toolbar, the inspector and `.glassEffect()`. egui remains the cross-platform UI.
 
 ## Decisions and trade-offs
 

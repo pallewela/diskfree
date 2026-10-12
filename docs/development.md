@@ -3,9 +3,13 @@
 ## Layout
 
 ```
+src/lib.rs        library root (rlib + staticlib)
+src/scan.rs       tree arena, parallel scanner, ScanJob, remove/graft/sort   (+ tests)
+src/explorer.rs   shared browsing state: rows, expand, filter, insights      (+ tests)
+src/insights.rs   hints, largest files, extension totals, fmt_age            (+ tests)
+src/ffi.rs        C ABI for the macOS app                                     (+ tests)
+include/diskfree.h  C header matching src/ffi.rs
 src/main.rs       egui app, CLI mode (--cli), OS actions
-src/scan.rs       tree arena, parallel scanner, remove/graft/sort   (+ tests)
-src/insights.rs   hints, largest files, extension totals, fmt_age   (+ tests)
 docs/             usage, architecture, this file
 private/          local planning notes (gitignored)
 ```

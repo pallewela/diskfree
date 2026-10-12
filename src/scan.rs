@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -283,6 +284,26 @@ impl Tree {
         true
     }
 
+    /// Selected ids whose ancestors are not also selected (so nothing is counted or trashed twice).
+    pub fn top_level(&self, sel: &HashSet<u32>) -> Vec<u32> {
+        let mut v: Vec<u32> = sel
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let mut p = self.nodes[id as usize].parent;
+                while p != u32::MAX {
+                    if sel.contains(&p) {
+                        return false;
+                    }
+                    p = self.nodes[p as usize].parent;
+                }
+                true
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
     pub fn path(&self, mut id: u32) -> PathBuf {
         let mut parts = Vec::new();
         while id != 0 {
@@ -293,6 +314,38 @@ impl Tree {
         let mut p = self.root.clone();
         p.extend(parts.iter().rev());
         p
+    }
+}
+
+/// Scans one or more roots on a background thread.
+pub struct ScanJob {
+    pub progress: Arc<Progress>,
+    handle: JoinHandle<Vec<Tree>>,
+}
+
+impl ScanJob {
+    pub fn start(roots: Vec<PathBuf>) -> ScanJob {
+        let progress = Arc::new(Progress::default());
+        let p = progress.clone();
+        let handle = std::thread::spawn(move || roots.iter().map(|r| Tree::scan(r, &p)).collect());
+        ScanJob { progress, handle }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    pub fn cancel(&self) {
+        self.progress.cancel.store(true, Relaxed);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.progress.cancel.load(Relaxed)
+    }
+
+    /// Blocks until the scan ends; one tree per root, in order.
+    pub fn finish(self) -> Vec<Tree> {
+        self.handle.join().expect("scan thread panicked")
     }
 }
 
@@ -361,5 +414,17 @@ mod tests {
         assert_eq!(t.nodes[big as usize].size, big_new);
         assert_eq!(t.nodes[0].size, big_new + link);
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn top_level_drops_nested() {
+        // 0 -> 1 -> 2, 0 -> 3
+        let node = |parent, children| Node { name: "x".into(), size: 1, files: 1, parent, children, kind: Kind::Dir, mtime: 0 };
+        let t = Tree {
+            nodes: vec![node(u32::MAX, vec![1, 3]), node(0, vec![2]), node(1, vec![]), node(0, vec![])],
+            root: PathBuf::from("/"),
+        };
+        assert_eq!(t.top_level(&HashSet::from([1, 2, 3])), vec![1, 3]);
+        assert_eq!(t.top_level(&HashSet::from([0, 2])), vec![0]);
     }
 }
