@@ -1,0 +1,133 @@
+# Architecture
+
+diskfree is one Rust binary with three source files:
+
+| File | Role |
+|---|---|
+| `src/scan.rs` | Core: tree model (arena), parallel scanner, mutations (remove, graft, sort) |
+| `src/insights.rs` | Core: cleanup hints, largest files, per-extension totals, age formatting |
+| `src/main.rs` | egui UI, CLI mode, OS actions (trash, reveal, clipboard, disk info) |
+
+```
+┌─────────────────────────── src/main.rs (egui / eframe) ───────────────────────────┐
+│ top bar · tree view (virtualized rows) · insights panel · trash dialog · keys     │
+│        │ background Job (std::thread)               │ OS actions                  │
+└────────┼────────────────────────────────────────────┼─────────────────────────────┘
+         ▼                                            ▼
+┌──────── core ────────────────────┐         ┌──────── OS / crates ─────────────────┐
+│ scan.rs:  Tree::scan, remove,    │         │ trash    (Trash / Recycle Bin)       │
+│           graft, sort, path      │         │ opener   (reveal in file manager)    │
+│ insights: compute, hint, fmt_age │         │ sysinfo  (disk list, free space)     │
+└────────────┬─────────────────────┘         └──────────────────────────────────────┘
+             ▼
+        std::fs (read_dir, symlink metadata)
+```
+
+## Data model
+
+The whole scan is a single **arena**, `Tree { nodes: Vec<Node>, root: PathBuf }`. Nodes refer to each other by `u32` index.
+
+```rust
+pub struct Node {
+    name: Box<str>,      // the root node holds the full root path
+    size: u64,           // allocated bytes, rolled up for dirs
+    files: u64,          // files (incl. symlinks) at any depth
+    parent: u32,         // u32::MAX = root or detached
+    children: Vec<u32>,  // kept sorted by the current Sort
+    kind: Kind,          // Dir | File | Symlink | Denied
+    mtime: u64,          // secs since epoch; dirs: newest change inside
+}
+```
+
+The arena keeps these invariants:
+
+- Node `0` is the root.
+- After a scan, a child's id is always greater than its parent's. Grafted nodes are appended, so the rule still holds for them. Scanning uses it to roll up sizes in one reverse pass.
+- A node is **live** if walking up its parents reaches `0`. `remove` and `graft` *detach* nodes by setting their `parent` to `u32::MAX` and leave the slots allocated. The next full scan reclaims them. `Tree::is_live` checks this.
+- Memory is about 80 bytes per node plus the name: roughly 400 MB for 5 million entries.
+
+`Tree::path(id)` rebuilds the path by walking up the parents, so full paths are never stored.
+
+## Scanner
+
+```
+                ┌───────── job channel (id, PathBuf) ─────────┐
+                ▼                                              │
+  ┌───────────────────────────┐                                │
+  │ workers × min(cores, 8)   │  read_entries(dir):            │
+  │  read_dir + metadata      │   - cancel check, progress     │
+  │  (no symlink following)   │   - Dir → Entry::Dir           │
+  └─────────────┬─────────────┘   - other → Entry::Leaf (size) │
+                │ result channel (id, Option<Vec<Entry>>)      │
+                ▼                                              │
+  ┌───────────────────────────┐                                │
+  │ builder (calling thread)  │  push each entry into arena ───┘
+  │  owns the arena           │  new dir → send job; pending += 1
+  └─────────────┬─────────────┘  pending == 0 → done
+                ▼
+     reverse-id pass: rollup(id) = Σ child size/files, max mtime, sort
+```
+
+- **Workers do only the slow part:** reading directories and their metadata. The builder thread owns the arena, so every node is written once and never copied.
+- **Sizes** are allocated bytes (`st_blocks × 512`) on Unix, so sparse files are not inflated. On Windows, the file length is used.
+- **Hardlinks** with `nlink > 1` are deduplicated by `(dev, ino)` in a shared `Mutex<HashSet>`. The mutex is only taken for multiply-linked files. Windows does not deduplicate.
+- **Skipped paths** (`SKIP`):
+  - macOS: `/System/Volumes/Data` (firmlinked into `/`, so it would be counted twice), `/Volumes` and `/dev`
+  - Linux: `/proc`, `/sys` and `/dev`
+  
+  The check compares full paths, so scanning `/Volumes/X` directly still works.
+- **Unreadable directories** become `Kind::Denied` instead of failing the scan.
+- **Cancellation:** a `Progress.cancel` flag makes `read_entries` return empty, and the queue drains within moments.
+- **Progress** is shared with the UI through atomics (`files`, `bytes`) and a `Mutex<String>` holding the current directory.
+
+## Mutations
+
+- `remove(id)` detaches the node, subtracts its size and file count from every ancestor (`adjust_up`), and re-sorts each ancestor's children.
+- `graft(id, sub)` replaces the subtree under `id` with a fresh scan: it detaches the old children, appends `sub`'s nodes with remapped ids, and applies the size difference to the ancestors.
+- `sort_children` and `sort_all` order children by size (descending), name (case-insensitive) or file count (descending).
+
+## Insights
+
+`insights::compute` walks the live tree once and collects three things:
+
+- **Candidates:** `hint(t, id)` matches by name, with a few context rules: `target` needs a sibling `Cargo.toml`, `Caches` must be inside `Library`, and `tmp` must be directly under the root. Nodes below a candidate are not listed again.
+- **Largest files:** the top 200 via `select_nth_unstable_by_key`, then sorted.
+- **Extension totals:** a `HashMap<ext, (bytes, files)>`.
+
+It is recomputed in full after every tree change. A `ponytail:` comment marks this as the place to switch to incremental updates if it gets slow.
+
+## UI (egui)
+
+- **Virtualized rows:** `rebuild_rows` flattens the expanded tree into `rows: Vec<(id, depth)>`, and `ScrollArea::show_rows` draws only the visible rows. Expanding or collapsing rebuilds the list.
+- **Selection** is a `HashSet<u32>` of node ids, so it survives expanding and collapsing. `top_level()` drops ids whose ancestor is also selected, so actions never double-count or double-trash. Selected nodes that are no longer live are pruned after every change.
+- **Filter:** a pre-order walk of the live nodes, folded in reverse, marks `hit` (the name matches) and `anc` (has a matching descendant). Ancestors auto-expand, and a matching folder shows its whole subtree.
+- **Background jobs:** a scan or rescan runs on a `std::thread`. The UI checks `JoinHandle::is_finished` each frame and repaints every 100 ms while a job runs. Rescans are grafted in. A cancelled rescan is discarded so it never grafts partial sizes.
+
+## Planned: native macOS UI (Stage 6)
+
+```
+SwiftUI app (macOS 26, Liquid Glass)        egui app (Linux, Windows, older macOS)
+        │  C ABI (include/diskfree.h)                 │  Rust API
+        ▼                                             ▼
+   src/ffi.rs  ──────────────►  lib: scan.rs · insights.rs · shared selection/filter helpers
+```
+
+The crate becomes a library (`rlib` + `staticlib`) with a small C ABI that uses opaque `Tree`/scan handles. A SwiftUI app built with SwiftPM links `libdiskfree.a`. It uses native `Table` multi-select, `FileManager.trashItem` and `NSWorkspace` reveal, and gets Liquid Glass from the toolbar, the inspector and `.glassEffect()`. egui remains the cross-platform UI.
+
+## Decisions and trade-offs
+
+| Decision | Why |
+|---|---|
+| Worker pool + single builder thread | Measured on `/`: 55 s single-threaded → 20 s at 417 MB peak. Recursive rayon splitting was 16 s but peaked at 1.2 GB because it copied subtree arenas. Rejected. |
+| `min(cores, 8)` workers | 12 or more threads gave no extra speed, only more kernel time spent waiting on file-system locks. |
+| Bind the job before matching | `while let Ok(j) = rx.lock().unwrap().recv()` holds the mutex guard through the loop body, which made the workers run one at a time (85 s). |
+| Allocated size only | It is what deleting frees. An apparent-size toggle was left out until someone needs it. |
+| No scan cache | A 20 s rescan is fast enough. |
+| Dim, not hide, for age | Hiding a folder because of one new file would hide its large old siblings. |
+| Detach instead of compacting | Remove and graft are O(depth). Detached slots are reclaimed by the next full scan. |
+
+Known limits:
+
+- APFS clones and shared blocks are counted once per file, like `du`.
+- Windows counts each hardlink in full.
+- Each node uses about 80 bytes plus its name.

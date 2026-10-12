@@ -2,6 +2,9 @@
 name = "diskfree"
 version = "0.1.0"
 edition = "2024"
+description = "Disk usage explorer: an expandable, size-sorted tree for finding what to clean up"
+license = "MIT"
+repository = "https://github.com/pallewela/diskfree"
 
 [dependencies]
 eframe = "0.36.2"
