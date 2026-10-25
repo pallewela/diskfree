@@ -1,3 +1,7 @@
+// Release builds on Windows are GUI apps (no console window). Debug builds keep the console,
+// so on Windows `--cli` only prints from a debug build.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use diskfree::explorer::Explorer;
 use diskfree::insights;
 use diskfree::scan::{fmt_size, Kind, Progress, ScanJob, Sort, Tree};

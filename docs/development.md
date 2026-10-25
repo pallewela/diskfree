@@ -85,6 +85,18 @@ Platform-specific code is limited to these spots:
 - the `SKIP` list: per OS
 - the default root: `C:\` on Windows
 
+## Releases
+
+`.github/workflows/release.yml` tests and packages each app on its own OS: `Diskfree-macos-arm64.zip` (the native app), `diskfree-windows-x64.zip` and `diskfree-linux-x64.tar.gz` (the egui app, built on Ubuntu 22.04 for an older glibc baseline).
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0   # builds, then publishes a GitHub Release with the three packages
+```
+
+Running the workflow by hand from the Actions tab builds the same packages as workflow artifacts without publishing a release.
+
+The builds are not signed yet. The macOS app is ad-hoc signed, so on other Macs it has to be allowed under System Settings ▸ Privacy & Security. Windows SmartScreen warns about the unsigned `.exe`. Release builds on Windows have no console window, so `--cli` prints nothing there; use a debug build (`cargo run -- --cli C:\`) for that.
+
 ## Conventions
 
 - Keep it small: standard library first, and a new crate only when it clearly pays for itself. The current crates are `eframe`, `sysinfo`, `trash`, `opener` and `notify`.

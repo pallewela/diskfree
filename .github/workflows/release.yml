@@ -1,0 +1,60 @@
+# Build, test and package every app on its own OS. Push a tag like v0.1.0 to publish a GitHub
+# Release; run it by hand (Actions tab) to just get the packages as workflow artifacts.
+# ponytail: unsigned builds (macOS ad-hoc, Windows unsigned); add Developer ID notarization and
+# Authenticode signing via repo secrets once the certificates exist.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      - run: ./scripts/build-mac-app.sh
+      - run: macos/.build/release/Diskfree --selftest
+      - run: ditto -c -k --keepParent target/Diskfree.app Diskfree-macos-arm64.zip
+      - uses: actions/upload-artifact@v4
+        with: { name: macos, path: Diskfree-macos-arm64.zip }
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      - run: cargo build --release
+      - run: Compress-Archive -Path target/release/diskfree.exe -DestinationPath diskfree-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: diskfree-windows-x64.zip }
+
+  linux:
+    # Oldest supported runner: the binary needs a glibc at least this old.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      - run: cargo build --release
+      - run: tar -czf diskfree-linux-x64.tar.gz -C target/release diskfree
+      - uses: actions/upload-artifact@v4
+        with: { name: linux, path: diskfree-linux-x64.tar.gz }
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { merge-multiple: true }
+      - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes ./*.zip ./*.tar.gz
+        env:
+          GH_TOKEN: ${{ github.token }}
