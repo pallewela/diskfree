@@ -19,6 +19,7 @@ It has a Rust core and two front ends:
   - Copy paths.
   - Rescan a folder.
   - **Move to Trash**, with a confirmation. Totals update right away, without a rescan.
+- **Live updates.** After a scan, totals follow changes on disk (FSEvents in the macOS app, `notify` in the egui app). Turn it off under **View ▸ Live updates**.
 - **Insights panel.**
   - *Cleanup hints:* `node_modules`, Cargo `target/`, caches, Xcode `DerivedData`, `Docker.raw`, `.Trash` and more. Hints are badges only; nothing is deleted automatically.
   - *Largest files:* the top 200 files in the scan.

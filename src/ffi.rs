@@ -10,7 +10,7 @@ use crate::insights;
 use crate::scan::{Kind, ScanJob, Sort};
 use std::collections::HashSet;
 use std::ffi::{c_char, CStr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 
 #[repr(C)]
@@ -224,6 +224,22 @@ pub unsafe extern "C" fn df_top_level(ex: *const Explorer, ids: *const u32, n: u
     let sel: HashSet<u32> = unsafe { std::slice::from_raw_parts(ids, n) }.iter().copied().collect();
     let top = unsafe { &*ex }.tree.top_level(&sel);
     unsafe { write_ids(out, cap, top.into_iter()) }
+}
+
+/// Node id for a path (UTF-8), or `UINT32_MAX` if it is not in the tree.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn df_find(ex: *const Explorer, path: *const c_char) -> u32 {
+    let path = unsafe { str_arg(path) };
+    unsafe { &*ex }.tree.find(Path::new(&*path)).unwrap_or(u32::MAX)
+}
+
+/// Re-read folders in place after they changed on disk; ids of surviving nodes stay the same.
+/// Writes up to `cap` new subfolder ids (they still need `df_rescan_start`); returns the full count.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn df_refresh_dirs(ex: *mut Explorer, ids: *const u32, n: usize, out: *mut u32, cap: usize) -> usize {
+    let ids = unsafe { std::slice::from_raw_parts(ids, n) };
+    let fresh = unsafe { &mut *ex }.refresh_dirs(ids);
+    unsafe { write_ids(out, cap, fresh.into_iter()) }
 }
 
 #[unsafe(no_mangle)]

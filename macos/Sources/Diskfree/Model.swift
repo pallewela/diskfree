@@ -1,4 +1,5 @@
 import AppKit
+import CoreServices
 import DiskfreeCore
 import Foundation
 import Observation
@@ -72,6 +73,14 @@ final class Model {
     var sort: SortMode = .size {
         didSet { if let ex { df_set_sort(ex, sort.rawValue); changed() } }
     }
+    /// Follow changes on disk with FSEvents (View ▸ Live Updates).
+    var liveUpdates = true {
+        didSet {
+            guard !watchedRoot.isEmpty else { return }
+            watch(watchedRoot)
+            if liveUpdates, ex != nil { status = "Live updates on. Rescan to pick up changes made while they were off." }
+        }
+    }
     var filter = "" {
         didSet { if let ex { df_set_filter(ex, filter); changed() } }
     }
@@ -80,12 +89,17 @@ final class Model {
     @ObservationIgnored private var target: UInt32? // job is a rescan of this node
     @ObservationIgnored private var rescanQueue: [UInt32] = []
     @ObservationIgnored private(set) var ex: OpaquePointer?
+    @ObservationIgnored private var stream: FSEventStreamRef?
+    @ObservationIgnored private var watchedRoot = ""
+    /// Folders FSEvents reported as changed -> whether they need a full rescan (events were dropped).
+    @ObservationIgnored private var dirty: [String: Bool] = [:]
 
     var hasTree: Bool { _ = revision; return ex != nil }
 
     func scan() {
         guard job == nil else { return }
         job = df_scan_start(rootPath)
+        watch(rootPath)
         scanning = true
         status = ""
         Task { await poll() }
@@ -109,6 +123,7 @@ final class Model {
     func load(_ path: String) {
         rootPath = path
         job = df_scan_start(path)
+        watch(path)
         adopt()
     }
 
@@ -126,6 +141,7 @@ final class Model {
             }
             if !startNextRescan() { scanning = false }
             changed()
+            applyChanges()
             return
         }
         let cancelled = df_scan_cancelled(job)
@@ -137,6 +153,62 @@ final class Model {
         scanning = false
         status = cancelled ? "Scan cancelled — showing partial results." : ""
         changed()
+        applyChanges()
+    }
+
+    // MARK: - Live updates
+
+    /// Watch `root` with FSEvents from now on, so changes made during the scan are caught too.
+    /// Only stops the current stream while live updates are off.
+    private func watch(_ root: String) {
+        if let stream {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            self.stream = nil
+        }
+        (dirty, watchedRoot) = ([:], root)
+        guard liveUpdates else { return }
+        // Unretained: the model lives as long as the app.
+        var ctx = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+                                       retain: nil, release: nil, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, count, paths, flags, _ in
+            let model = Unmanaged<Model>.fromOpaque(info!).takeUnretainedValue()
+            let paths = Unmanaged<CFArray>.fromOpaque(paths).takeUnretainedValue() as! [String]
+            let deep = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+            MainActor.assumeIsolated {
+                for i in 0..<count {
+                    model.dirty[paths[i], default: false] = model.dirty[paths[i]] == true || flags[i] & deep != 0
+                }
+                model.applyChanges()
+            }
+        }
+        stream = FSEventStreamCreate(nil, callback, &ctx, [root] as CFArray,
+                                     FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 2.0,
+                                     FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes))
+        if let stream {
+            FSEventStreamSetDispatchQueue(stream, .main)
+            FSEventStreamStart(stream)
+        }
+    }
+
+    /// Fold changed folders into the tree: re-read them in place, rescan new folders in the
+    /// background. Waits while a scan or rescan runs; `adopt` calls it again afterwards.
+    private func applyChanges() {
+        guard job == nil, let ex, !dirty.isEmpty else { return }
+        var shallow: [UInt32] = [], deep = Set<UInt32>()
+        for (path, mustScan) in dirty {
+            let id = df_find(ex, path)
+            guard id != UInt32.max, node(id)?.isDir == true else { continue }
+            if mustScan { deep.insert(id) } else { shallow.append(id) }
+        }
+        dirty = [:]
+        var fresh = [UInt32](repeating: 0, count: 256)
+        let n = df_refresh_dirs(ex, shallow, shallow.count, &fresh, fresh.count)
+        if n > fresh.count { deep.formUnion(shallow) } else { deep.formUnion(fresh.prefix(n)) }
+        changed()
+        rescanQueue = topLevel(deep)
+        _ = startNextRescan()
     }
 
     private func changed() {

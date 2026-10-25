@@ -86,6 +86,7 @@ The macOS 26 app has the same features with native controls:
   - Click to select. ⌘-click and Shift-click extend the selection, and ⌘A selects all rows.
   - Click the chevron, double-click, or press → / ← to expand or collapse folders.
 - **Actions:** right-click for Reveal in Finder, Copy Path(s), Rescan and Move to Trash…. ⌫ opens the Move to Trash confirmation for the selection. Items go to the Trash through `FileManager`, so there is no Finder automation prompt.
+- **Live updates:** after a scan, changes on disk show up within a couple of seconds, without a rescan. Expanded folders stay open. Toggle with **View ▸ Live Updates**.
 - **Info bar:** a floating glass bar at the bottom shows disk usage, the selection total and status messages. While a scan runs, a glass capsule shows progress and has a cancel button.
 - **Insights:** in the right-hand inspector with Cleanup / Largest / Types tabs. Click an entry to jump to it in the tree. **Select All** (Cleanup tab) followed by ⌫ moves all hints to the Trash.
 - **Sizes** use decimal units (GB), like Finder.

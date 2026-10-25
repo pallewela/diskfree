@@ -66,6 +66,9 @@ int64_t df_reveal(DfExplorer *ex, uint32_t id);                          // row 
 void df_remove(DfExplorer *ex, const uint32_t *ids, size_t n);           // after deleting on disk
 size_t df_top_level(const DfExplorer *ex, const uint32_t *ids, size_t n, uint32_t *out, size_t cap);
 bool df_is_live(const DfExplorer *ex, uint32_t id);
+uint32_t df_find(const DfExplorer *ex, const char *path);                // UINT32_MAX if not in the tree
+// After folders changed on disk: re-read in place, write new subfolder ids (need a rescan), return the full count.
+size_t df_refresh_dirs(DfExplorer *ex, const uint32_t *ids, size_t n, uint32_t *out, size_t cap);
 
 // ---- insights (write up to cap ids, return the full count) ----
 size_t df_largest(const DfExplorer *ex, uint32_t *out, size_t cap);

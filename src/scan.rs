@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -273,6 +273,81 @@ impl Tree {
         self.adjust_up(parent, dsize, dfiles, by);
     }
 
+    /// Re-read one directory in place: files are updated, added or dropped, and subfolders that
+    /// still exist keep their ids (so their expanded state). Returns new subfolders, which are
+    /// added empty and still need a scan. Leaves the node alone if it can't be read.
+    // ponytail: no hardlink dedup against the rest of the tree; a new hardlink counts twice until a full scan.
+    pub fn refresh_dir(&mut self, id: u32, by: Sort) -> Vec<u32> {
+        let Some(entries) = read_entries(&self.path(id), &Progress::default(), &Seen::default()) else {
+            return Vec::new();
+        };
+        let old = std::mem::take(&mut self.nodes[id as usize].children);
+        let mut by_name: HashMap<Box<str>, u32> = old.iter().map(|&c| (self.nodes[c as usize].name.clone(), c)).collect();
+        let (mut kids, mut fresh) = (Vec::new(), Vec::new());
+        for e in entries {
+            match e {
+                Entry::Dir(name, mtime, _) => match by_name.remove(&name) {
+                    Some(c) if matches!(self.nodes[c as usize].kind, Kind::Dir | Kind::Denied) => kids.push(c),
+                    replaced => {
+                        if let Some(c) = replaced {
+                            self.nodes[c as usize].parent = u32::MAX;
+                        }
+                        let c = self.push(name, id, Kind::Dir, 0, mtime);
+                        kids.push(c);
+                        fresh.push(c);
+                    }
+                },
+                Entry::Leaf(name, kind, size, mtime) => match by_name.remove(&name) {
+                    Some(c) if self.nodes[c as usize].kind == kind => {
+                        let n = &mut self.nodes[c as usize];
+                        (n.size, n.mtime) = (size, mtime);
+                        kids.push(c);
+                    }
+                    replaced => {
+                        if let Some(c) = replaced {
+                            self.nodes[c as usize].parent = u32::MAX;
+                        }
+                        kids.push(self.push(name, id, kind, size, mtime));
+                    }
+                },
+            }
+        }
+        for c in by_name.into_values() {
+            self.nodes[c as usize].parent = u32::MAX;
+        }
+        let n = &self.nodes;
+        let size: u64 = kids.iter().map(|&c| n[c as usize].size).sum();
+        let files: u64 = kids.iter().map(|&c| n[c as usize].files).sum();
+        let newest = kids.iter().map(|&c| n[c as usize].mtime).max().unwrap_or(0);
+        let node = &mut self.nodes[id as usize];
+        let (dsize, dfiles) = (size as i64 - node.size as i64, files as i64 - node.files as i64);
+        (node.children, node.size, node.files, node.kind) = (kids, size, files, Kind::Dir);
+        node.mtime = node.mtime.max(newest);
+        let parent = node.parent;
+        self.sort_children(id, by);
+        self.adjust_up(parent, dsize, dfiles, by);
+        fresh
+    }
+
+    /// Node id for a path under the root, as a file watcher reports it. Also matched against the
+    /// root's canonical form (watchers report /private/var for /var) and, on macOS, with the
+    /// /System/Volumes/Data firmlink prefix removed. Exact match only.
+    pub fn find(&self, path: &Path) -> Option<u32> {
+        let data = cfg!(target_os = "macos").then(|| path.strip_prefix("/System/Volumes/Data").ok()).flatten();
+        let unlinked = data.map(|p| Path::new("/").join(p));
+        let path = unlinked.as_deref().unwrap_or(path);
+        let rel = path
+            .strip_prefix(&self.root)
+            .ok()
+            .or_else(|| path.strip_prefix(fs::canonicalize(&self.root).ok()?).ok())?;
+        let mut id = 0u32;
+        for part in rel.components() {
+            let name = part.as_os_str().to_string_lossy();
+            id = *self.nodes[id as usize].children.iter().find(|&&c| *self.nodes[c as usize].name == *name)?;
+        }
+        Some(id)
+    }
+
     /// Still attached to the tree (not trashed or replaced by a rescan).
     pub fn is_live(&self, mut id: u32) -> bool {
         while id != 0 {
@@ -413,6 +488,38 @@ mod tests {
         t.graft(big, sub, Sort::Size);
         assert_eq!(t.nodes[big as usize].size, big_new);
         assert_eq!(t.nodes[0].size, big_new + link);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn refresh_dir_updates_in_place() {
+        let d = std::env::temp_dir().join(format!("diskfree-refresh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("sub/keep")).unwrap();
+        fs::write(d.join("sub/keep/k.bin"), vec![1u8; 40_000]).unwrap();
+        fs::write(d.join("sub/grow.bin"), vec![1u8; 10_000]).unwrap();
+        fs::write(d.join("sub/gone.bin"), vec![1u8; 10_000]).unwrap();
+        let mut t = Tree::scan(&d, &Progress::default());
+        let sub = t.find(&d.join("sub")).unwrap();
+        let keep = t.find(&d.join("sub/keep")).unwrap();
+        let grow = t.find(&d.join("sub/grow.bin")).unwrap();
+        assert_eq!(t.find(&d.join("nope")), None);
+
+        fs::write(d.join("sub/grow.bin"), vec![1u8; 100_000]).unwrap();
+        fs::remove_file(d.join("sub/gone.bin")).unwrap();
+        fs::write(d.join("sub/new.bin"), vec![1u8; 20_000]).unwrap();
+        fs::create_dir_all(d.join("sub/newdir")).unwrap();
+        let fresh = t.refresh_dir(sub, Sort::Size);
+
+        let size = |p: &str| alloc_size(&fs::metadata(d.join(p)).unwrap());
+        assert_eq!(fresh, vec![t.find(&d.join("sub/newdir")).unwrap()]);
+        assert_eq!(t.find(&d.join("sub/keep")), Some(keep), "existing subfolder keeps its id");
+        assert_eq!(t.find(&d.join("sub/grow.bin")), Some(grow));
+        assert_eq!(t.find(&d.join("sub/gone.bin")), None);
+        let total = size("sub/keep/k.bin") + size("sub/grow.bin") + size("sub/new.bin");
+        assert_eq!((t.nodes[sub as usize].size, t.nodes[sub as usize].files), (total, 3));
+        assert_eq!(t.nodes[0].size, total, "change rolls up to the root");
+        assert_eq!(t.nodes[sub as usize].children[0], grow, "re-sorted largest first");
         fs::remove_dir_all(&d).unwrap();
     }
 

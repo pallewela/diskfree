@@ -2,9 +2,12 @@ use diskfree::explorer::Explorer;
 use diskfree::insights;
 use diskfree::scan::{fmt_size, Kind, Progress, ScanJob, Sort, Tree};
 use eframe::egui;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
@@ -18,8 +21,8 @@ fn main() -> eframe::Result {
             viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 680.0]),
             ..Default::default()
         },
-        Box::new(move |_| {
-            let mut app = App::default();
+        Box::new(move |cc| {
+            let mut app = App { ctx: Some(cc.egui_ctx.clone()), ..Default::default() };
             if let Some(root) = args.get(1) {
                 app.root_input = root.clone();
                 app.start_scan(vec![]);
@@ -68,6 +71,15 @@ struct App {
     show_side: bool,
     side: Side,
     age_days: u64, // dim rows changed within this many days; 0 = off
+    ctx: Option<egui::Context>,
+    live: bool, // View ▸ Live updates
+    // Set up off the UI thread: inotify adds one watch per folder, which takes a while on big trees.
+    watch_setup: Option<JoinHandle<notify::Result<notify::RecommendedWatcher>>>,
+    watcher: Option<notify::RecommendedWatcher>,
+    changes: Option<mpsc::Receiver<notify::Result<notify::Event>>>,
+    watched: PathBuf,
+    dirty: HashMap<PathBuf, bool>, // changed folder -> needs a full rescan (events were lost)
+    last_apply: Option<Instant>,
 }
 
 impl Default for App {
@@ -89,6 +101,14 @@ impl Default for App {
             show_side: true,
             side: Side::Candidates,
             age_days: 0,
+            ctx: None,
+            live: true,
+            watch_setup: None,
+            watcher: None,
+            changes: None,
+            watched: PathBuf::new(),
+            dirty: HashMap::new(),
+            last_apply: None,
         }
     }
 }
@@ -97,7 +117,11 @@ impl App {
     fn start_scan(&mut self, targets: Vec<u32>) {
         let roots: Vec<PathBuf> = match &self.ex {
             Some(ex) if !targets.is_empty() => targets.iter().map(|&id| ex.tree.path(id)).collect(),
-            _ => vec![PathBuf::from(self.root_input.trim())],
+            _ => {
+                let root = PathBuf::from(self.root_input.trim());
+                self.watch(root.clone());
+                vec![root]
+            }
         };
         self.job = Some(Job { scan: ScanJob::start(roots), targets });
         self.status.clear();
@@ -123,6 +147,86 @@ impl App {
             }
         }
         self.after_tree_change();
+    }
+
+    /// Watch `root` from now on (so changes made during the scan are caught too). Only stops the
+    /// current watcher while live updates are off.
+    fn watch(&mut self, root: PathBuf) {
+        (self.watch_setup, self.watcher, self.changes) = (None, None, None);
+        self.dirty.clear();
+        self.watched = root.clone();
+        if !self.live {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.changes = Some(rx);
+        let ctx = self.ctx.clone();
+        self.watch_setup = Some(std::thread::spawn(move || {
+            use notify::Watcher;
+            let mut w = notify::recommended_watcher(move |ev| {
+                let _ = tx.send(ev);
+                if let Some(ctx) = &ctx {
+                    ctx.request_repaint();
+                }
+            })?;
+            w.watch(&root, notify::RecursiveMode::Recursive)?;
+            Ok(w)
+        }));
+    }
+
+    /// Collect watcher events; every 2 s (and only between jobs) re-read changed folders in place
+    /// and rescan new ones in the background.
+    fn poll_changes(&mut self, ctx: &egui::Context) {
+        if self.watch_setup.as_ref().is_some_and(|h| h.is_finished()) {
+            match self.watch_setup.take().unwrap().join() {
+                Ok(Ok(w)) => self.watcher = Some(w),
+                Ok(Err(e)) => {
+                    self.changes = None;
+                    self.status = format!("Live updates off: {e}");
+                }
+                Err(_) => self.changes = None,
+            }
+        }
+        let Some(rx) = &self.changes else { return };
+        for ev in rx.try_iter().flatten() {
+            let deep = ev.need_rescan();
+            if ev.paths.is_empty() && deep {
+                self.dirty.insert(self.watched.clone(), true);
+            }
+            // Events name the changed entry; its folder is what gets re-read.
+            for p in ev.paths {
+                let dir = if deep { p } else { p.parent().map_or(p.clone(), Path::to_path_buf) };
+                *self.dirty.entry(dir).or_default() |= deep;
+            }
+        }
+        if self.dirty.is_empty() || self.job.is_some() {
+            return;
+        }
+        let wait = Duration::from_secs(2).saturating_sub(self.last_apply.map_or(Duration::MAX, |t| t.elapsed()));
+        if !wait.is_zero() {
+            ctx.request_repaint_after(wait);
+            return;
+        }
+        self.last_apply = Some(Instant::now());
+        let Some(ex) = &mut self.ex else { return };
+        let (mut shallow, mut deep) = (Vec::new(), HashSet::new());
+        for (path, must_scan) in self.dirty.drain() {
+            let Some(id) = ex.tree.find(&path) else { continue };
+            if !matches!(ex.tree.nodes[id as usize].kind, Kind::Dir | Kind::Denied) {
+                continue;
+            }
+            if must_scan {
+                deep.insert(id);
+            } else {
+                shallow.push(id);
+            }
+        }
+        deep.extend(ex.refresh_dirs(&shallow));
+        let deep = ex.tree.top_level(&deep);
+        self.after_tree_change();
+        if !deep.is_empty() {
+            self.start_scan(deep);
+        }
     }
 
     /// Call after the arena grew or nodes were removed.
@@ -248,6 +352,16 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let busy = self.job.is_some();
         ui.horizontal_wrapped(|ui| {
+            ui.menu_button("View", |ui| {
+                if ui.checkbox(&mut self.live, "Live updates").changed() {
+                    if !self.watched.as_os_str().is_empty() {
+                        self.watch(self.watched.clone());
+                    }
+                    if self.live && self.ex.is_some() {
+                        self.status = "Live updates on. Rescan to pick up changes made while they were off.".into();
+                    }
+                }
+            });
             egui::ComboBox::from_id_salt("vol").selected_text("Volume").show_ui(ui, |ui| {
                 for d in self.disks.list() {
                     let mp = d.mount_point().to_string_lossy();
@@ -546,6 +660,7 @@ impl eframe::App for App {
         if self.job.as_ref().is_some_and(|j| j.scan.is_done()) {
             self.finish_scan();
         }
+        self.poll_changes(ctx);
         self.keys(ctx);
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         if self.show_side {
@@ -553,5 +668,53 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default().show(ui, |ui| self.tree_view(ui));
         self.trash_dialog(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wait until `ok`, running the frame-loop bits that matter (finish jobs, poll the watcher).
+    fn pump(app: &mut App, what: &str, ok: impl Fn(&App) -> bool) {
+        let (ctx, end) = (egui::Context::default(), Instant::now() + Duration::from_secs(20));
+        while !ok(app) {
+            assert!(Instant::now() < end, "timed out waiting: {what}");
+            if app.job.as_ref().is_some_and(|j| j.scan.is_done()) {
+                app.finish_scan();
+            }
+            app.poll_changes(&ctx);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn live_updates_follow_disk() {
+        let d = std::env::temp_dir().join(format!("diskfree-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/a.bin"), vec![1u8; 50_000]).unwrap();
+        let mut app = App { root_input: d.to_string_lossy().into(), ..Default::default() };
+        app.start_scan(vec![]);
+        pump(&mut app, "scan + watcher", |a| a.ex.is_some() && a.job.is_none() && a.watcher.is_some());
+        let size = |a: &App| a.ex.as_ref().unwrap().tree.nodes[0].size;
+        let has = |a: &App, p: &str| a.ex.as_ref().unwrap().tree.find(&d.join(p)).is_some();
+        let before = size(&app);
+
+        std::fs::write(d.join("sub/new.bin"), vec![1u8; 200_000]).unwrap();
+        std::fs::create_dir_all(d.join("newdir")).unwrap();
+        std::fs::write(d.join("newdir/x.bin"), vec![1u8; 100_000]).unwrap();
+        pump(&mut app, "new file and folder", |a| {
+            a.job.is_none() && has(a, "sub/new.bin") && has(a, "newdir/x.bin")
+        });
+        assert!(size(&app) > before + 250_000);
+
+        std::fs::remove_file(d.join("sub/new.bin")).unwrap();
+        pump(&mut app, "deleted file drops out", |a| !has(a, "sub/new.bin"));
+
+        app.live = false;
+        app.watch(app.watched.clone());
+        assert!(app.changes.is_none() && app.watcher.is_none(), "toggle off stops watching");
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

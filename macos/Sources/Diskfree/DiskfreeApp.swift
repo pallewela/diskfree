@@ -35,6 +35,11 @@ struct DiskfreeApp: App {
                 }
         }
         .defaultSize(width: 1100, height: 720)
+        .commands {
+            CommandGroup(after: .sidebar) {
+                Toggle("Live Updates", isOn: $model.liveUpdates)
+            }
+        }
     }
 }
 
@@ -90,6 +95,32 @@ struct DiskfreeApp: App {
     let newBin = model.largest.first!
     model.jump(newBin)
     precondition(model.rows.contains { $0.id == newBin } && model.selection == [newBin], "jump expands and selects")
+
+    // Live updates: a new file is picked up in place, a new folder by a background rescan.
+    func waitFor(_ what: String, _ ok: () -> Bool) {
+        let end = Date().addingTimeInterval(15)
+        while !ok() {
+            precondition(Date() < end, "timed out waiting: \(what)")
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+    }
+    let before = model.node(0)!.size
+    try! Data(count: 1_000_000).write(to: dir.appendingPathComponent("live.bin"))
+    try! fm.createDirectory(at: dir.appendingPathComponent("livedir"), withIntermediateDirectories: true)
+    try! Data(count: 200_000).write(to: dir.appendingPathComponent("livedir/x.bin"))
+    waitFor("live file and folder") {
+        !model.scanning && model.rows.contains { $0.name == "live.bin" }
+            && model.rows.contains { $0.name == "livedir" && $0.node.size > 0 }
+    }
+    let liveDir = model.rows.first { $0.name == "livedir" }!.node.size
+    precondition(model.node(0)!.size > before + liveDir, "root total grows")
+    try! fm.removeItem(at: dir.appendingPathComponent("live.bin"))
+    waitFor("deleted file drops out") { model.node(0)!.size == before + liveDir }
+
+    model.liveUpdates = false
+    try! Data(count: 500_000).write(to: dir.appendingPathComponent("ignored.bin"))
+    RunLoop.main.run(until: Date().addingTimeInterval(4))
+    precondition(!model.rows.contains { $0.name == "ignored.bin" }, "no updates while live updates are off")
     try? fm.removeItem(at: dir)
     print("selftest ok — \(trashed)")
 }

@@ -143,6 +143,8 @@ The crate is a library (`rlib` + `staticlib`) with a small C ABI that uses opaqu
   - `FileManager.trashItem` (no Finder automation prompt), then `df_remove`
   - `NSWorkspace.activateFileViewerSelecting` and `NSPasteboard`
   - Rescan is a queue of `df_rescan_start` / `df_scan_finish_graft` jobs over the top-level selection.
+- **Live updates:** an FSEvents stream on the scan root (2 s latency) collects changed folders. Once no job is running, `df_find` maps each one to a node and `df_refresh_dirs` re-reads it shallowly in place (`Tree::refresh_dir`), so surviving nodes keep their ids and expanded state. New subfolders, and folders whose events were dropped (`MustScanSubDirs`), go through the rescan queue. **View ▸ Live Updates** stops and restarts the stream.
+- **Live updates in the egui app:** the `notify` crate (inotify, ReadDirectoryChangesW, FSEvents) watches the root recursively. The watcher is set up on a background thread because inotify adds one watch per folder. Each event's parent folder is queued, and `poll_changes` applies the queue between jobs at most every 2 s, through the same `refresh_dirs` and rescan path. Events flagged `need_rescan` (overflow) rescan the folder fully. If the watch fails, for example at the inotify watch limit, the status bar shows *Live updates off* and the app carries on without them.
 - **Liquid Glass:** the toolbar and inspector are glass automatically. Custom glass: the scan progress capsule and the info bar (`.glassEffect(.regular, in: .capsule)`), hint badges (`.regular.tint(.blue)`), and `.glass` buttons.
 - **Ownership rules:** name and hint pointers in `DfNode` are only valid until the next mutation. Swift copies names into `Row` immediately.
 

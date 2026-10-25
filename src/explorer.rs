@@ -1,7 +1,7 @@
 //! UI-agnostic browsing state shared by the egui app and the native macOS app (via `ffi`).
 
 use crate::insights::{self, Stats};
-use crate::scan::{Sort, Tree};
+use crate::scan::{Kind, Sort, Tree};
 
 pub struct Explorer {
     pub tree: Tree,
@@ -92,6 +92,21 @@ impl Explorer {
             }
         }
         self.refresh();
+    }
+
+    /// Re-read folders in place after they changed on disk (see `Tree::refresh_dir`).
+    /// Returns new subfolders, which still need a rescan.
+    // ponytail: refresh() redoes filter + insights over the whole tree per batch; go incremental if that shows up on huge trees.
+    pub fn refresh_dirs(&mut self, ids: &[u32]) -> Vec<u32> {
+        let mut fresh = Vec::new();
+        for &id in ids {
+            let n = &self.tree.nodes[id as usize];
+            if self.tree.is_live(id) && matches!(n.kind, Kind::Dir | Kind::Denied) {
+                fresh.extend(self.tree.refresh_dir(id, self.sort));
+            }
+        }
+        self.refresh();
+        fresh
     }
 
     fn apply_filter(&mut self) {

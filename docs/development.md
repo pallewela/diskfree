@@ -87,7 +87,7 @@ Platform-specific code is limited to these spots:
 
 ## Conventions
 
-- Keep it small: standard library first, and a new crate only when it clearly pays for itself. The current crates are `eframe`, `sysinfo`, `trash` and `opener`.
+- Keep it small: standard library first, and a new crate only when it clearly pays for itself. The current crates are `eframe`, `sysinfo`, `trash`, `opener` and `notify`.
 - Comments starting with `ponytail:` mark deliberate shortcuts that have a known limit, along with how to remove that limit. List them with `grep -rn "ponytail:" src`.
 - Non-trivial logic gets a small `#[test]`.
 
