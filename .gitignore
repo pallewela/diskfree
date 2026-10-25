@@ -1,3 +1,5 @@
 /target
 /private
 /macos/.build
+.DS_Store
+/icon/.preview
