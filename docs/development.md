@@ -40,6 +40,7 @@ The SwiftUI front end lives in `macos/`, a SwiftPM package. Xcode isn't needed; 
 
 ```sh
 ./scripts/build-mac-app.sh                 # core + Swift app -> target/Diskfree.app (ad-hoc signed)
+./scripts/build-mac-app.sh --dmg           # also target/Diskfree-<version>.dmg for distribution
 
 # or step by step:
 cargo build --release --lib                # rebuild the core whenever src/ changes
@@ -87,7 +88,7 @@ Platform-specific code is limited to these spots:
 
 ## Releases
 
-`.github/workflows/release.yml` tests and packages each app on its own OS: `Diskfree-macos-arm64.zip` (the native app), `diskfree-windows-x64.zip` and `diskfree-linux-x64.tar.gz` (the egui app, built on Ubuntu 22.04 for an older glibc baseline).
+`.github/workflows/release.yml` tests and packages each app on its own OS: `Diskfree-macos-arm64.dmg` (the native app; open it and drag diskfree to Applications), `diskfree-windows-x64.zip` and `diskfree-linux-x64.tar.gz` (the egui app, built on Ubuntu 22.04 for an older glibc baseline).
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0   # builds, then publishes a GitHub Release with the three packages
