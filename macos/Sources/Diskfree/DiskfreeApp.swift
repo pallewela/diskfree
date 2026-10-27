@@ -171,7 +171,13 @@ struct TreeTable: View {
                 .width(min: 70, ideal: 90)
                 TableColumn("%") { row in
                     let p = row.node.parent_size == 0 ? 0 : Double(row.node.size) / Double(row.node.parent_size)
-                    ProgressView(value: min(p, 1)).progressViewStyle(.linear)
+                    // Drawn, not ProgressView: Table reuses cells while scrolling, and a reused
+                    // ProgressView animates from the previous row's value to the new one.
+                    Capsule().fill(.quaternary)
+                        .overlay(alignment: .leading) {
+                            GeometryReader { g in Capsule().fill(.tint).frame(width: g.size.width * min(p, 1)) }
+                        }
+                        .frame(height: 5)
                 }
                 .width(min: 60, ideal: 90)
                 TableColumn("Files") { row in
