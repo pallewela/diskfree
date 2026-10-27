@@ -94,6 +94,8 @@ Platform-specific code is limited to these spots:
 git tag v0.1.0 && git push origin v0.1.0   # builds, then publishes a GitHub Release with the three packages
 ```
 
+A tagged release also updates the Homebrew cask in [pallewela/homebrew-tap](https://github.com/pallewela/homebrew-tap) (`brew install --cask pallewela/tap/diskfree`). It does that by sending a `diskfree-release` event with the DMG checksum, which needs a `TAP_REPO_TOKEN` secret in this repo; without the secret the step is skipped. The cask clears the quarantine flag, so the unsigned app opens without the Gatekeeper warning.
+
 Running the workflow by hand from the Actions tab builds the same packages as workflow artifacts without publishing a release.
 
 The builds are not signed yet. The macOS app is ad-hoc signed, so on other Macs it has to be allowed under System Settings ▸ Privacy & Security. Windows SmartScreen warns about the unsigned `.exe`. Release builds on Windows have no console window, so `--cli` prints nothing there; use a debug build (`cargo run -- --cli C:\`) for that.
