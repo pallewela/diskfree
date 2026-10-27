@@ -13,7 +13,7 @@ diskfree is a Rust library (the core) plus two front ends: the egui binary and a
 | `macos/Sources/Diskfree/Model.swift` | Swift view model over the C ABI: rows, selection, insights, actions |
 | `macos/Sources/Diskfree/DiskfreeApp.swift` | SwiftUI views: toolbar, table, inspector, glass bars; `--cli` / `--selftest` |
 | `macos/Sources/DiskfreeCore/` | C module map linking `libdiskfree.a` |
-| `scripts/build-mac-app.sh` | Builds and ad-hoc signs `target/Diskfree.app` |
+| `scripts/build-mac-app.sh` | Builds and ad-hoc signs `target/Diskfree.app`; `--dmg` also packs a disk image |
 
 ```
 ┌─────────────────────────── src/main.rs (egui / eframe) ───────────────────────────┐

@@ -28,6 +28,14 @@ It has a Rust core and two front ends:
 - **Dim recent.** Greys out items changed in the last 7, 30, 90 or 365 days, so old items stand out.
 - **Volume picker.** Shows the free and used space of the scanned disk.
 
+## Install (macOS 26+, Apple Silicon)
+
+```sh
+brew install --cask pallewela/tap/diskfree
+```
+
+The app isn't notarized yet. The cask clears the quarantine flag so macOS opens it without the "could not verify" warning. If you download the DMG from Releases instead, run `xattr -dr com.apple.quarantine /Applications/Diskfree.app` after copying the app, or allow it under System Settings ▸ Privacy & Security ▸ Open Anyway.
+
 ## Build and run
 
 You need a recent stable Rust toolchain.

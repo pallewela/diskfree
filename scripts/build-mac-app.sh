@@ -1,6 +1,7 @@
 #!/bin/sh
 # Build the native macOS app (macOS 26+) as target/Diskfree.app.
 # A real bundle lets you grant it Full Disk Access and launch it from Finder.
+# --dmg also packs it into target/Diskfree-<version>.dmg (drag to Applications).
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -34,3 +35,16 @@ PLIST
 # Ad-hoc signature so macOS keeps privacy grants (Full Disk Access) stable for this build.
 codesign --force --sign - "$APP"
 echo "Built $APP"
+
+if [ "${1:-}" = "--dmg" ]; then
+    # ponytail: plain Finder window, no background art or icon layout; add create-dmg if that matters.
+    STAGE=target/dmg
+    DMG=target/Diskfree-$VERSION.dmg
+    rm -rf "$STAGE" "$DMG"
+    mkdir -p "$STAGE"
+    cp -R "$APP" "$STAGE/"
+    ln -s /Applications "$STAGE/Applications"
+    hdiutil create -volname diskfree -srcfolder "$STAGE" -format UDZO -fs APFS -ov "$DMG" >/dev/null
+    rm -rf "$STAGE"
+    echo "Built $DMG"
+fi
